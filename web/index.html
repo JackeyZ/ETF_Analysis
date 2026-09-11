@@ -1,0 +1,1429 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ETF PEG 实时分析</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2a3140;
+    --txt:#e6edf3; --dim:#8b949e; --accent:#4f9cf9; --good:#3fb950;
+    --warn:#d29922; --bad:#f85149; --chip:#21262d;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  a{color:var(--accent)}
+  .wrap{max-width:1280px;margin:0 auto;padding:24px 20px 60px}
+  header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:22px}
+  h1{font-size:22px;font-weight:650;letter-spacing:.5px}
+  .sub{color:var(--dim);font-size:12.5px}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:18px}
+
+  /* 搜索 */
+  .search{position:relative;display:flex;gap:10px;align-items:center}
+  input[type=text],select{background:var(--panel2);border:1px solid var(--line);color:var(--txt);
+    border-radius:8px;padding:10px 12px;font-size:14px;outline:none;transition:.15s}
+  input[type=text]{flex:1;min-width:220px}
+  input[type=text]:focus,select:focus{border-color:var(--accent)}
+  button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10px 18px;
+    font-size:14px;cursor:pointer;font-weight:600;transition:.15s}
+  button:hover{filter:brightness(1.12)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.ghost{background:var(--chip);border:1px solid var(--line);color:var(--txt);font-weight:500}
+
+  .sugg{position:absolute;top:44px;left:0;right:120px;background:var(--panel2);border:1px solid var(--line);
+    border-radius:10px;max-height:330px;overflow:auto;z-index:50;display:none;box-shadow:0 12px 32px #0008}
+  .sugg div{padding:9px 13px;cursor:pointer;display:flex;justify-content:space-between;gap:10px}
+  .sugg div:hover,.sugg div.on{background:var(--chip)}
+  .sugg .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sugg .cd{color:var(--dim);font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+
+  /* 指标卡 */
+  .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+  .m{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .m .k{color:var(--dim);font-size:12px;margin-bottom:6px;letter-spacing:.3px}
+  .m .v{font-size:25px;font-weight:660;font-variant-numeric:tabular-nums;line-height:1.2}
+  .m .n{font-size:11.5px;color:var(--dim);margin-top:4px}
+  .hero .v{font-size:34px}
+  .g{color:var(--good)} .w{color:var(--warn)} .b{color:var(--bad)}
+
+  /* 表格 */
+  .tbl-wrap{overflow:auto;border-radius:10px;border:1px solid var(--line);max-height:600px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{background:var(--panel2);color:var(--dim);font-weight:600;text-align:right;
+     padding:10px 12px;position:sticky;top:0;white-space:nowrap;cursor:pointer;user-select:none;z-index:2}
+  th.l,td.l{text-align:left}
+  th:hover{color:var(--txt)}
+  td{padding:9px 12px;text-align:right;border-top:1px solid var(--line);font-variant-numeric:tabular-nums}
+  tbody tr:hover{background:#ffffff07}
+  .mono{font-family:ui-monospace,Consolas,monospace}
+  .tag{display:inline-block;padding:1px 7px;border-radius:5px;font-size:11px;background:var(--chip);color:var(--dim)}
+  .tag.ok{color:var(--good)} .tag.no{color:var(--bad)}
+
+  .bar{height:8px;background:var(--panel2);border-radius:5px;overflow:hidden;margin:10px 0 4px}
+  .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),#7ee787);width:0;transition:.3s}
+
+  .note{background:#d2992214;border:1px solid #d2992240;color:#e3b341;border-radius:8px;
+    padding:10px 14px;font-size:12.5px;margin-top:14px}
+  .hd{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+  .hd h2{font-size:16px;font-weight:620}
+  .muted{color:var(--dim);font-size:12.5px}
+  .spinner{display:inline-block;width:13px;height:13px;border:2px solid var(--line);
+    border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .empty{color:var(--dim);text-align:center;padding:34px;font-size:13px}
+  footer{color:var(--dim);font-size:12px;text-align:center;margin-top:26px;line-height:1.9}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>ETF PEG 实时分析</h1>
+    <span class="sub">穿透持仓 · 整体法加权 · 数据源：东方财富（免费）</span>
+  </header>
+
+  <div id="connWarn" class="note" style="display:none;margin-bottom:16px"></div>
+
+  <!-- 搜索 -->
+  <div class="card">
+    <div class="search">
+      <input type="text" id="kw" placeholder="输入 ETF 或场外基金代码/名称，如 510300 / 白酒 / 易方达蓝筹" autocomplete="off">
+      <select id="mode">
+        <option value="ttm">增速口径：TTM 净利同比（稳健）</option>
+        <option value="latest">增速口径：最新报告期累计同比（灵敏）</option>
+      </select>
+      <button id="go">分析</button>
+      <div class="sugg" id="sugg"></div>
+    </div>
+    <div class="muted" style="margin-top:10px">
+      常用：
+      <a href="#" data-c="510300">沪深300</a> ·
+      <a href="#" data-c="510500">中证500</a> ·
+      <a href="#" data-c="159915">创业板</a> ·
+      <a href="#" data-c="588000">科创50</a> ·
+      <a href="#" data-c="512480">半导体</a> ·
+      <a href="#" data-c="512880">证券</a> ·
+      <a href="#" data-c="512170">医疗</a> ·
+      <a href="#" data-c="515030">新能源车</a>
+    </div>
+  </div>
+
+  <!-- 分析结果 -->
+  <div class="card" id="result" style="display:none">
+    <div class="hd">
+      <h2 id="r-title">—</h2>
+      <span class="muted" id="r-meta"></span>
+      <span id="r-ai-btns" style="display:none;gap:8px;align-items:center">
+        <button class="ghost" id="aiCopyBtn" style="padding:6px 12px;font-size:12.5px">复制给 AI</button>
+        <button class="ghost" id="aiDlBtn" style="padding:6px 12px;font-size:12.5px">下载 .md</button>
+      </span>
+    </div>
+    <div class="metrics" id="r-metrics"></div>
+    <div class="note" id="r-warn" style="display:none"></div>
+
+    <div id="r-basis" style="display:none;margin-top:14px">
+      <div class="hd" style="margin-bottom:8px">
+        <h2 style="font-size:14px">增速的计算依据</h2>
+        <span class="muted" id="r-basis-head"></span>
+      </div>
+      <div id="r-basis-body" style="font-size:12.5px;line-height:1.9"></div>
+    </div>
+
+    <div class="hd" style="margin-top:22px">
+      <h2>成分股明细</h2>
+      <span class="muted" id="r-count"></span>
+    </div>
+    <div class="tbl-wrap">
+      <table id="r-tbl">
+        <thead><tr>
+          <th class="l" data-s="code">代码</th>
+          <th class="l" data-s="name">名称</th>
+          <th data-s="weight">权重%</th>
+          <th data-s="price">现价</th>
+          <th data-s="pe_ttm">PE-TTM</th>
+          <th data-s="g">增速%</th>
+          <th data-s="peg">PEG</th>
+          <th class="l" data-s="fin_period">财报期</th>
+          <th class="l" data-s="fin_date">披露日</th>
+          <th class="l">近9期增速</th>
+          <th class="l">状态</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div id="r-bf" style="display:none;margin-top:22px">
+      <div class="hd" style="margin-bottom:10px">
+        <h2>历史回填</h2>
+        <span style="display:flex;gap:8px;align-items:center">
+          <select id="bfYears" style="padding:6px 9px;font-size:12.5px">
+            <option value="0.5">近半年</option>
+            <option value="1">近 1 年</option>
+            <option value="2">近 2 年</option>
+            <option value="3">近 3 年</option>
+            <option value="5">近 5 年</option>
+            <option value="10" selected>全部可用（约 8.6 年）</option>
+          </select>
+          <button class="ghost" id="bfBtn" style="padding:6px 12px;font-size:12.5px">回填历史</button>
+          <button class="ghost" id="bfCancelBtn" style="padding:6px 12px;font-size:12.5px;display:none">取消</button>
+        </span>
+      </div>
+      <div class="muted" id="bfNote" style="font-size:12.5px">
+        个股每日 PE 上游最早到 2018-01-02；首次回填需逐只拉取成分股历史，耗时几分钟，之后走本地库。
+      </div>
+      <div class="bar" id="bfBarWrap" style="display:none"><i id="bfBar"></i></div>
+    </div>
+
+    <div id="r-chart" style="display:none;margin-top:22px">
+      <div class="hd" style="margin-bottom:10px">
+        <h2>历史 PEG</h2>
+        <span style="display:flex;gap:8px;align-items:center">
+          <select id="histBy" style="padding:6px 9px;font-size:12.5px">
+            <option value="year">按年</option>
+            <option value="quarter" selected>按季</option>
+            <option value="month">按月</option>
+          </select>
+          <select id="histMetric" style="padding:6px 9px;font-size:12.5px">
+            <option value="peg" selected>PEG</option>
+            <option value="pe">PE</option>
+            <option value="g_ttm">增速%</option>
+          </select>
+        </span>
+      </div>
+      <div id="chartBody"></div>
+    </div>
+
+    <div id="r-series" style="display:none;margin-top:22px">
+      <div class="hd" style="margin-bottom:8px">
+        <h2>增速序列（近 9 个报告期）</h2>
+        <span class="muted">每个报告期各算一次组合 TTM 同比</span>
+      </div>
+      <div id="r-series-body"></div>
+    </div>
+
+    <div id="r-history" style="display:none;margin-top:22px">
+      <div class="hd" style="margin-bottom:10px">
+        <h2>每日明细</h2>
+        <span class="muted" id="r-hist-note"></span>
+      </div>
+      <div id="r-hist-body"></div>
+    </div>
+  </div>
+
+  <!-- 排行扫描 -->
+  <div class="card">
+    <div class="hd">
+      <h2>全市场 ETF · PEG 排行</h2>
+      <span style="display:flex;gap:8px;align-items:center">
+        <select id="scanLimit" style="padding:7px 10px;font-size:13px">
+          <option value="40">规模前 40 只</option>
+          <option value="80">规模前 80 只</option>
+          <option value="150">规模前 150 只</option>
+        </select>
+        <button class="ghost" id="scanBtn" style="padding:7px 14px;font-size:13px">开始扫描</button>
+        <button class="ghost" id="cancelBtn" style="padding:7px 14px;font-size:13px;display:none">取消</button>
+      </span>
+    </div>
+    <div class="muted" id="scanInfo">按流通市值排序，逐只穿透持仓计算 PEG；结果由低到高排列（PEG 越低越"便宜"）。</div>
+    <div class="bar" id="scanBar" style="display:none"><i></i></div>
+    <div class="tbl-wrap" id="scanWrap" style="display:none;margin-top:14px">
+      <table id="scanTbl">
+        <thead><tr>
+          <th class="l">ETF</th><th class="l">代码</th>
+          <th data-k="pe">PE</th><th data-k="g">增速%</th>
+          <th data-k="peg">PEG</th><th data-k="coverage">覆盖率%</th>
+          <th data-k="n_valid">有效/总数</th><th class="l">报告期</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 本地数据库 -->
+  <div class="card">
+    <div class="hd">
+      <h2>本地数据库</h2>
+      <button class="ghost" id="storeBtn" style="padding:7px 14px;font-size:13px">刷新</button>
+    </div>
+    <div id="storeInfo" class="muted">加载中…</div>
+    <div class="muted" style="margin-top:10px;font-size:12px">
+      不变的数据（历史财报、基金定期报告持仓）写入本地后不再重复下载；
+      价格与 PE 每秒都在变，只在内存里短时缓存。
+    </div>
+
+    <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+      <div class="hd" style="margin-bottom:8px">
+        <h2 style="font-size:15px">全市场 PE 初始化</h2>
+        <span style="display:flex;gap:8px;align-items:center">
+          <button class="ghost" id="initBtn" style="padding:6px 12px;font-size:12.5px">开始初始化</button>
+          <button class="ghost" id="initCancelBtn" style="padding:6px 12px;font-size:12.5px;display:none">取消</button>
+        </span>
+      </div>
+      <div class="muted" id="peCov" style="font-size:12.5px">加载中…</div>
+      <div class="bar" id="initBar" style="display:none"><i></i></div>
+      <div class="muted" style="font-size:12px;margin-top:8px">
+        一次性把全市场约 5600 只 A 股 2018 年以来的每日 PE / 市值 / 收盘价拉进本地库。
+        完成后任意 ETF 的回填都不再回源拉 PE —— 全区间首次回填从约 37 分钟降到约 5 分钟，且所有 ETF 共用这一份数据。
+        首次约 1.5~2 小时，支持断点续传（中断后重跑自动跳过已拉的）；数据库会从约 300 MB 增长到约 1.5 GB。
+      </div>
+
+      <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+        <div class="hd" style="margin-bottom:8px">
+          <h2 style="font-size:15px">港股数据初始化</h2>
+          <span style="display:flex;gap:8px;align-items:center">
+            <button class="ghost" id="initHkBtn" style="padding:6px 12px;font-size:12.5px">开始初始化</button>
+            <button class="ghost" id="initHkCancelBtn" style="padding:6px 12px;font-size:12.5px;display:none">取消</button>
+          </span>
+        </div>
+        <div class="muted" id="hkCov" style="font-size:12.5px">加载中…</div>
+        <div class="bar" id="initHkBar" style="display:none"><i></i></div>
+        <div class="muted" style="font-size:12px;margin-top:8px">
+          港股<strong>没有现成的历史 PE 接口</strong>（东财估值库不含港股），本工具自己算：
+          <b>PE = 当日总市值 ÷ 当日已披露的最新 TTM 股东应占溢利</b>，与 A 股同口径。
+          所以这里拉的是每日收盘价 / 市值 + 各期财报，写入<strong>独立的港股库</strong>。
+          完成后含港股的基金（如持仓里有腾讯、中海油的那些）才能把港股真正算进 PEG。
+          首次约 40~60 分钟，支持断点续传；港股库约 0.8 GB。
+          港股财报为<strong>半年度</strong>口径，增速更新比 A 股慢半年，属正常现象。
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    数据：东方财富（实时行情 / ETF 定期报告全持仓 / 业绩报表）—— 均为免费公开接口<br>
+    PEG 为估值参考指标，不构成投资建议；持仓为季度数据，增速存在滞后，请结合行业景气度判断
+  </footer>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+
+/* 统一请求封装：任何情况下都抛出「看得懂」的错误，
+   绝不让 res.json() 的解析错误（如 Unexpected token 'U'）直接暴露给用户。 */
+async function api(path) {
+  let res, text;
+  try {
+    res = await fetch(path);
+  } catch (e) {
+    throw new Error('无法连接本地服务。请确认 run.py 正在运行，'
+      + '并检查浏览器代理/安全软件是否拦截了 127.0.0.1。');
+  }
+  try {
+    text = await res.text();
+  } catch (e) {
+    throw new Error(`读取响应失败：${e.message}`);
+  }
+
+  const head = (text || '').slice(0, 60).replace(/\s+/g, ' ');
+  const intercepted = /unauthorized|proxy|authentication/i.test(head);
+  const hint = intercepted
+    ? `请求被拦截（响应为 "${head}"）。通常是浏览器代理、VPN 或安全软件拦截了本地地址：`
+      + `请在代理设置中放行 127.0.0.1 与 localhost，或改用 http://localhost:${location.port} 访问。`
+    : '';
+
+  if (!res.ok) {
+    if (text.trim().startsWith('{')) {
+      try {
+        throw new Error(JSON.parse(text).error || ('HTTP ' + res.status));
+      } catch (e) {
+        if (e.message) throw e;
+      }
+    }
+    throw new Error(hint || `服务返回 HTTP ${res.status}：${text.slice(0, 120) || '(空响应)'}`);
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error(hint || `响应不是合法 JSON（HTTP ${res.status}，开头为 "${head}"）。`);
+  }
+}
+const fmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? '—'
+  : Number(v).toLocaleString('zh-CN', {minimumFractionDigits: d, maximumFractionDigits: d});
+const pct = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? '—' : fmt(v, d) + '%';
+const cls = v => v === null || v === undefined ? '' : (v < 0 ? 'b' : (v < 1 ? 'g' : (v < 2 ? '' : 'w')));
+
+/* ---------------- ETF 搜索 ---------------- */
+let ALL = [], picked = null;
+api('/api/etfs?limit=2000').then(j => { if (j.ok) ALL = j.data; }).catch(() => {});
+
+const kw = $('#kw'), sugg = $('#sugg');
+let idx = -1;
+
+let SUGG = [];
+function renderSugg(list) {
+  SUGG = list;
+  if (!list.length) { sugg.style.display = 'none'; return; }
+  sugg.innerHTML = list.slice(0, 40).map((e, i) =>
+    `<div data-i="${i}"><span class="nm">${e.name}</span>`
+    + `<span class="cd">${e.code}</span>`
+    + (e.type ? `<span class="cd" style="opacity:.7;margin-left:6px">${e.type}</span>` : '')
+    + `</div>`).join('');
+  sugg.style.display = 'block';
+  sugg.querySelectorAll('div').forEach(d => d.onclick = () => choose(list[+d.dataset.i]));
+}
+
+/* 全市场基金（约 2.8 万只，含场外）走服务端搜索；ETF 本地即时匹配 */
+let fundTimer = null;
+async function searchFunds(v) {
+  try {
+    const j = await api('/api/funds?kw=' + encodeURIComponent(v) + '&limit=30');
+    if (!j.ok) return;
+    // 与本地 ETF 结果合并去重，ETF 优先
+    const seen = new Set(SUGG.map(x => x.code));
+    const merged = SUGG.concat(j.data.filter(f => !seen.has(f.code)));
+    renderSugg(merged);
+  } catch (e) { /* 搜索失败时保留本地结果 */ }
+}
+function choose(e) { picked = e; kw.value = `${e.name} (${e.code})`; sugg.style.display = 'none'; analyze(e.code); }
+
+kw.oninput = () => {
+  const raw = kw.value.trim();
+  const v = raw.toLowerCase();
+  idx = -1;
+  clearTimeout(fundTimer);
+  if (!raw) { sugg.style.display = 'none'; return; }
+  renderSugg(ALL.filter(e => e.name.toLowerCase().includes(v) || e.code.includes(v)));
+  if (raw.length >= 2) {
+    fundTimer = setTimeout(() => searchFunds(raw), 220);
+  }
+};
+kw.onkeydown = e => {
+  const items = [...sugg.querySelectorAll('div')];
+  if (e.key === 'ArrowDown') { e.preventDefault(); idx = Math.min(idx + 1, items.length - 1); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); idx = Math.max(idx - 1, 0); }
+  else if (e.key === 'Enter') {
+    e.preventDefault();
+    if (items[idx]) items[idx].click();
+    else if (/^\d{6}$/.test(kw.value.trim())) analyze(kw.value.trim());
+    return;
+  } else return;
+  items.forEach((d, i) => d.classList.toggle('on', i === idx));
+  items[idx] && items[idx].scrollIntoView({block: 'nearest'});
+};
+document.querySelectorAll('[data-c]').forEach(a => a.onclick = e => {
+  e.preventDefault();
+  const c = a.dataset.c;
+  const hit = ALL.find(x => x.code === c);
+  picked = hit || {code: c, name: c};
+  kw.value = `${picked.name} (${c})`;
+  analyze(c);
+});
+$('#go').onclick = () => {
+  const m = kw.value.match(/(\d{6})/);
+  if (m) analyze(m[1]);
+  else if (picked) analyze(picked.code);
+};
+
+/* ---------------- 单只分析 ---------------- */
+let CUR = null, SORT = {k: 'weight', asc: false};
+
+async function analyze(code) {
+  const mode = $('#mode').value;
+  $('#result').style.display = 'block';
+  $('#r-title').innerHTML = `<span class="spinner"></span> 正在穿透分析 ${code} …`;
+  $('#r-metrics').innerHTML = '';
+  $('#r-tbl').querySelector('tbody').innerHTML = '';
+  $('#r-meta').textContent = '';
+  $('#r-count').textContent = '首次需拉取全市场行情与财报，请稍候';
+  $('#r-warn').style.display = 'none';
+  $('#result').scrollIntoView({behavior: 'smooth', block: 'start'});
+
+  try {
+    const j = await api(`/api/analyze?code=${code}&mode=${mode}`);
+    if (!j.ok) throw new Error(j.error);
+    CUR = j.data;
+    renderResult(CUR, mode);
+  } catch (err) {
+    $('#r-title').textContent = '分析失败';
+    $('#r-metrics').innerHTML =
+      `<div class="m" style="grid-column:1/-1">
+         <div class="k">${code} 分析未成功</div>
+         <div style="color:var(--bad);font-size:13px;line-height:1.8">${err.message}</div>
+       </div>`;
+    $('#r-count').textContent = '';
+    $('#r-warn').style.display = 'none';
+    $('#r-basis').style.display = 'none';
+    $('#r-series').style.display = 'none';
+    $('#r-history').style.display = 'none';
+    $('#r-chart').style.display = 'none';
+    $('#r-bf').style.display = 'none';
+    $('#r-ai-btns').style.display = 'none';
+    $('#r-tbl').querySelector('tbody').innerHTML = '';
+  }
+}
+
+function renderResult(d, mode) {
+  $('#r-title').textContent = `${d.name} (${d.code})`;
+  $('#r-meta').textContent =
+    (d.fund_type ? `${d.fund_type} · ` : '')
+    + `持仓期 ${d.report_date || '—'} · 财报期 ${d.fin_period || '—'}`
+    + (d.equity_ratio != null ? ` · 股票仓位 ${d.equity_ratio.toFixed(0)}%` : '')
+    + (d.n_oversea ? ` · 港股美股 ${d.n_oversea} 只` : '')
+    + (d.pe_date ? ` · PE 数据日 ${d.pe_date}` : '') + ` · 更新 ${d.updated_at || ''}`;
+
+  const g = mode === 'ttm' ? d.g_ttm : d.g_latest;
+  const gm = d.stocks.length ? d.stocks[0] : null;
+  const items = [
+    {k: 'PEG（整体法）', v: d.peg, n: 'PE ÷ 增速，<1 通常视为低估', hero: 1, c: cls(d.peg)},
+    {k: 'PE-TTM（整体法）', v: d.pe, n: 'Σ总市值 ÷ Σ归母净利润', d: 2},
+    {k: mode === 'ttm' ? '归母净利增速（TTM·同比）' : '归母净利增速（累计·同比）',
+     v: g, n: mode === 'ttm' ? '滚动12个月 vs 去年同期滚动12个月'
+       : '本期累计 vs 去年同期累计', d: 2, u: '%',
+     c: g === null ? '' : (g > 0 ? 'g' : 'b')},
+    {k: 'PEG（中位数法）', v: d.peg_median, n: 'PE中位数 ÷ 增速中位数，抗极端值', d: 2},
+    {k: '权重覆盖率', v: d.coverage, n: `有效 ${d.n_valid} / 共 ${d.n_total} 只`, d: 1, u: '%',
+     c: d.coverage >= 70 ? 'g' : (d.coverage >= 50 ? 'w' : 'b')},
+    {k: '全样本增速（TTM·同比）', v: d.g_all, n: '含负增长成分股，衡量剔除偏差', d: 2, u: '%',
+     c: d.g_all > 0 ? 'g' : 'b'},
+    ...(d.fund_type ? [{
+      k: '股票仓位', v: d.equity_ratio, d: 1, u: '%',
+      n: `${d.fund_type} · A股 ${d.n_a} 只`
+        + (d.n_oversea ? ` · 港美 ${d.n_oversea} 只（无 PE，未计入）` : ''),
+      c: (d.equity_ratio || 0) >= 85 ? 'g' : ((d.equity_ratio || 0) >= 70 ? 'w' : 'b'),
+    }] : []),
+  ];
+  $('#r-metrics').innerHTML = items.map(m => `
+    <div class="m ${m.hero ? 'hero' : ''}">
+      <div class="k">${m.k}</div>
+      <div class="v ${m.c || ''}">${m.v === null || m.v === undefined ? '—' : fmt(m.v, m.d ?? 2) + (m.u || '')}</div>
+      <div class="n">${m.n || ''}</div>
+    </div>`).join('');
+
+  const w = $('#r-warn');
+  if (d.warn) { w.style.display = 'block'; w.textContent = '⚠ ' + d.warn; } else w.style.display = 'none';
+
+  renderBasis(d);
+  renderSeries(d);
+
+  $('#r-count').textContent = `共 ${d.n_total} 只，点击表头可排序`;
+  drawTable(d);
+  $('#r-bf').style.display = 'block';
+  $('#r-ai-btns').style.display = 'flex';
+  loadHistory(d.code);
+}
+
+/* ---------------- 近 9 期增速序列 ---------------- */
+function renderSeries(d) {
+  const box = $('#r-series');
+  const gs = d.growth_series;
+  if (!gs || !gs.length) { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+
+  const maxAbs = Math.max(...gs.map(x => Math.abs(x.g || 0)), 1);
+  const bar = (v) => {
+    if (v === null || v === undefined) return '<span class="muted">—</span>';
+    const w = Math.min(50, Math.abs(v) / maxAbs * 50);
+    return `<span style="display:inline-block;position:relative;width:76px;height:9px;
+              background:#1c2230;border-radius:2px;vertical-align:middle">
+              <i style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:#4a5260"></i>
+              <i style="position:absolute;top:0;bottom:0;width:${w}%;border-radius:2px;
+                 ${v >= 0 ? 'left:50%' : 'right:50%'};background:${v >= 0 ? '#3fb950' : '#f85149'}">
+              </i></span>`;
+  };
+
+  const rows = gs.map(s => `
+    <tr>
+      <td class="l mono">${s.period}</td>
+      <td class="l">${s.label}</td>
+      <td class="${s.g > 0 ? 'g' : (s.g !== null ? 'b' : '')}">${fmt(s.g, 2)}</td>
+      <td class="${s.g_valid > 0 ? 'g' : (s.g_valid !== null ? 'b' : '')}">${fmt(s.g_valid, 2)}</td>
+      <td>${s.vused}/${s.used}</td>
+      <td class="l">${bar(s.g)}</td>
+    </tr>`).join('');
+
+  $('#r-series-body').innerHTML = `
+    <div class="tbl-wrap" style="max-height:none">
+      <table style="font-size:12.5px">
+        <thead><tr>
+          <th class="l">报告期</th><th class="l">报告类型</th>
+          <th>全样本增速%</th><th>正增长样本%</th><th>样本</th>
+          <th class="l">分布</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <div class="muted" style="margin-top:8px;font-size:12px">
+      序列统一用<strong>全样本</strong>口径（含亏损与负增长），这样各期之间可比；
+      若每期都按各自的「有效样本」算，被剔除的公司逐期不同，趋势会失真。
+      上方指标卡的增速是有效样本口径，两者之差即剔除偏差。
+    </div>`;
+}
+
+/* ---------------- 增速计算依据 ---------------- */
+function renderBasis(d) {
+  const b = d.fin_basis, box = $('#r-basis');
+  if (!b || !b.parts || !b.parts.length) { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+
+  const ttmMode = b.mode !== 'latest';
+  $('#r-basis-head').textContent =
+    `入口报告：${b.latest_label}（${b.latest}）· `
+    + (ttmMode ? 'TTM 净利同比' : '累计同比')
+    + (b.pit ? ' · 按各公司真实披露日逐只对齐' : '');
+
+  let pitHtml = '';
+  if (b.pit) {
+    const dist = b.dist || [];
+    const tot = dist.reduce((s, x) => s + x[1], 0) || 1;
+    pitHtml =
+      `<div style="color:var(--txt);margin:8px 0 4px">
+         <b>PIT 对齐</b>：各公司披露日不同，这里逐只只采用「已公开」的财报
+         —— 早披露的提前计入，晚披露的自动回退到它上一期已披露的报告，
+         不会拿尚未公开的数据（无前视偏差）。
+       </div>`
+      + (dist.length > 1
+        ? `<div style="color:var(--dim);margin-bottom:8px">
+             当前基准期分布：
+             ${dist.map(x => `${x[0]} × ${x[1]} 家（${(x[1] / tot * 100).toFixed(0)}%）`).join('、')}
+           </div>`
+        : '');
+  }
+
+  const rows = b.parts.map(p =>
+    `<tr><td class="l mono">${p.period}</td><td class="l">${p.label}</td>`
+    + `<td class="l">${p.role}</td></tr>`).join('');
+
+  const formula = ttmMode
+    ? (b.parts.length > 2
+        ? `<div style="color:var(--txt);margin:8px 0 4px">
+             TTM(本期) &nbsp;&nbsp;= 本期累计 + 上年年报 − 去年同期累计<br>
+             TTM(去年同期) = 去年同期累计 + 前年年报 − 前年同期累计<br>
+             增速 = [TTM(本期) − TTM(去年同期)] ÷ |TTM(去年同期)| × 100%
+           </div>`
+        : `<div style="color:var(--txt);margin:8px 0 4px">
+             本期为年报，年报本身就是 TTM，直接与上年年报相比。
+           </div>`)
+    : `<div style="color:var(--txt);margin:8px 0 4px">
+         直接用该期「累计归母净利同比」＝ 本期累计 vs 去年同期累计（东财 SJLTZ）。
+       </div>`;
+
+  $('#r-basis-body').innerHTML = formula + pitHtml
+    + (b.pe
+        ? `<div style="color:var(--txt);margin:8px 0 4px">
+             <b>PE 口径</b>：${b.pe}
+           </div>`
+        : '')
+    + `<div style="color:var(--dim);margin-bottom:6px">
+         两个窗口相隔 12 个月，所以是<b>同比</b>（不是环比）。共用到 ${b.parts.length} 份报告：
+       </div>`
+    + `<div class="tbl-wrap" style="max-height:none">
+         <table style="font-size:12.5px">
+           <thead><tr><th class="l">报告期</th><th class="l">报告</th><th class="l">用途</th></tr></thead>
+           <tbody>${rows}</tbody>
+         </table>
+       </div>`
+    + `<div style="color:var(--dim);margin-top:6px">
+         入口报告随披露进度自动推进（一季报 4/30、半年报 8/31、三季报 10/31、年报次年 4/30），
+         所以增速会在这些日期跳变，属正常现象。
+         成分股表里的「财报期 / 披露日」两列即为<strong>该行实际采用的报告</strong>。
+       </div>`;
+}
+
+/* ---------------- 后台任务通用轮询（回填 / 初始化共用）---------------- */
+/* 长任务必须异步 + 轮询：同步等 HTTP 响应会让界面只剩一个转圈，
+   而且浏览器超时后连结果都拿不到。 */
+let jobTimer = null, jobTick = null, jobDone = null,
+    jobLaunched = false, jobKind = null;
+
+/* 服务端同一时刻只跑一个 _JOB 任务。任务进行中把「启动」按钮全禁用，
+   一来不会撞上 409，二来用户也不会误以为两者能并行。 */
+function setJobBusy(busy) {
+  ['#initBtn', '#initHkBtn', '#bfBtn'].forEach(sel => {
+    const b = $(sel);
+    if (b) b.disabled = busy;
+  });
+}
+
+/* kind -> 把界面切回「运行中」并接管轮询。
+   刷新页面后靠它把 UI 重新接到服务端还在跑的任务上。 */
+const JOB_RESUME = {};
+
+/* 接管一个「已经在跑」的任务：不再发启动请求，只挂轮询。 */
+function attachJob(kind, onTick, onDone) {
+  jobKind = kind;
+  jobTick = onTick; jobDone = onDone; jobLaunched = true;
+  clearInterval(jobTimer);
+  setJobBusy(true);
+  jobTimer = setInterval(pollJob, 900);
+  pollJob();
+}
+
+async function startJob(kind, qs, onTick, onDone) {
+  let st = null;
+  try { st = (await api('/api/job/status')).data; } catch (e) { /* 取不到就照常启动 */ }
+
+  // 刷新页面后任务其实还在服务端跑着，只是前端不记得了。
+  // 这种情况不该报「已有任务在进行」，而应该直接接管它——
+  // 否则用户点一下按钮只会看到界面闪一下就恢复原状。
+  if (st && st.running && st.kind === kind) {
+    attachJob(kind, onTick, onDone);
+    return;
+  }
+  if (st && st.running) {
+    onDone(null, new Error(
+      `已有任务在进行（${st.kind}），请等它结束或先点「取消」`));
+    return;
+  }
+
+  jobKind = kind;
+  jobTick = onTick; jobDone = onDone; jobLaunched = false;
+  setJobBusy(true);
+  clearInterval(jobTimer);
+  jobTimer = setInterval(pollJob, 900);
+  try {
+    const res = await fetch('/api/job/start?' + qs);
+    const j = await res.json().catch(() => null);
+    // 必须校验响应：服务端在「已有任务在跑 / 参数非法」时会返回非 2xx + ok:false，
+    // 此时绝不能挂上轮询，否则会把别的任务的进度显示到这次的进度条上。
+    if (!res.ok || !j || j.ok !== true) {
+      throw new Error((j && j.error) || `启动失败（HTTP ${res.status}）`);
+    }
+    jobLaunched = true;                 // 启动成功前不判定「已结束」
+  } catch (e) {
+    clearInterval(jobTimer);
+    setJobBusy(false);
+    const f = jobDone; jobTick = jobDone = null; jobKind = null;
+    if (f) f(null, e);
+  }
+}
+
+async function pollJob() {
+  let d;
+  try { d = (await api('/api/job/status')).data; } catch (e) { return; }
+  // 双保险：只认自己那一类任务。即便服务端将来又漏判，
+  // 也不会把 A 股任务的进度画到港股进度条上。
+  if (jobKind && d.kind && d.kind !== jobKind) return;
+  if (!jobLaunched || d.running) { if (jobTick) jobTick(d); return; }
+  clearInterval(jobTimer);
+  setJobBusy(false);
+  const f = jobDone; jobTick = jobDone = null; jobKind = null;
+  if (f) f(d, null);
+}
+
+/* ---------------- 历史回填 + 历史 PEG 图表 ---------------- */
+let HIST = { daily: [], by_year: [], by_quarter: [], by_month: [] };
+
+{
+  const bfEnter = () => {
+    $('#bfBtn').disabled = true;
+    $('#bfCancelBtn').style.display = '';
+    $('#bfCancelBtn').disabled = false;
+    $('#bfBarWrap').style.display = 'block';
+    $('#bfNote').innerHTML = `<span class="spinner"></span> 正在启动…`;
+  };
+  const bfTick = d => {
+    $('#bfBar').style.width = (d.pct || 0) + '%';
+    $('#bfNote').innerHTML =
+      `<span class="spinner"></span> ${(d.pct || 0).toFixed(1)}%　${d.stage || ''}`;
+  };
+  const bfDone = (d, err) => {
+    $('#bfBarWrap').style.display = 'none';
+    $('#bfCancelBtn').style.display = 'none';
+    $('#bfBtn').disabled = false;
+    if (err) {
+      $('#bfNote').innerHTML = `<span style="color:var(--bad)">启动失败：${err.message}</span>`;
+      return;
+    }
+    if (d && d.error) {
+      $('#bfNote').innerHTML = `<span style="color:var(--bad)">回填失败：${d.error}</span>`;
+      return;
+    }
+    const r = d && d.result;
+    if (!r || d.stage === '已取消') { $('#bfNote').textContent = '已取消回填'; return; }
+    HIST = { daily: r.daily || [], by_year: r.by_year || [],
+             by_quarter: r.by_quarter || [], by_month: r.by_month || [] };
+    // rows 是「区间内交易日数」：区间早已算满时函数会提前返回，并非本次新增
+    $('#bfNote').textContent =
+      `回填完成：共 ${r.rows} 个交易日（${r.daily && r.daily.length
+        ? r.daily[r.daily.length - 1].date + ' ~ ' + r.daily[0].date : '无'}）`;
+    drawHist();
+    renderDaily();
+    loadStore();
+  };
+  JOB_RESUME['backfill'] = () => { bfEnter(); attachJob('backfill', bfTick, bfDone); };
+  $('#bfBtn').onclick = () => {
+    if (!CUR) return;
+    bfEnter();
+    $('#bfBar').style.width = '0%';
+    startJob('backfill', `kind=backfill&code=${CUR.code}&years=${$('#bfYears').value}`,
+             bfTick, bfDone);
+  };
+  $('#bfCancelBtn').onclick = () => {
+    fetch('/api/job/cancel');
+    $('#bfCancelBtn').disabled = true;
+    $('#bfNote').innerHTML = '<span class="spinner"></span> 正在取消…';
+  };
+}
+
+['histBy', 'histMetric'].forEach(id =>
+  $('#' + id).onchange = () => drawHist());
+
+async function loadHistory(code) {
+  // 只读：取已有历史（日线 + 三种聚合一次拿全），不触发回填
+  try {
+    const j = await api(`/api/history?code=${code}&years=10&by=all`);
+    if (j.ok && j.data && j.data.daily && j.data.daily.length >= 2) {
+      HIST = { daily: j.data.daily, by_year: j.data.by_year || [],
+               by_quarter: j.data.by_quarter || [], by_month: j.data.by_month || [] };
+      const d = j.data.daily;
+      $('#bfNote').textContent =
+        `已缓存 ${d.length} 个交易日（${d[d.length - 1].date} ~ ${d[0].date}）`
+        + `，点「回填历史」可补全更长区间`;
+      drawHist();
+      renderDaily();
+      return;
+    }
+  } catch (e) { /* ignore */ }
+}
+
+/* ---------------- 导出给 AI（复制 / 下载 .md） ---------------- */
+/* 数据要全但精炼，格式为 LLM 优化的 Markdown。 */
+const STATUS_CN = {
+  ok: '有效', no_quote: '无行情', no_pe: '亏损/无PE', no_growth: '负增长剔除',
+  oversea: '无法估值', no_data: '无数据',
+};
+/* 市场标记：5 位 = 港股（半年报口径），1/0 = A 股，其余（美股等）本工具无法估值 */
+const mktTag = s => {
+  if (s.market != null && String(s.market) !== 'None') {
+    const m = String(s.market);
+    if (m === '116') return 'H';
+    if (m === '1' || m === '0') return 'A';
+    return '其他';
+  }
+  return s.code && String(s.code).length === 5 ? 'H' : 'A';
+};
+
+function buildAiReport(d, hist, extra) {
+  const mode = $('#mode').value;
+  const gUsed = mode === 'ttm' ? d.g_ttm : d.g_latest;
+  const gs = d.growth_series || [];
+  const months = hist.by_month || [];
+  const now = new Date();
+  const ymd = now.toISOString().slice(0, 10).replace(/-/g, '');
+  const L = [];
+
+  L.push(`# ${d.name}(${d.code}) 估值分析数据`);
+  L.push('');
+  L.push('> 以下为 ETF/基金 PEG 估值工具导出的结构化数据，供 AI 做估值分析。');
+  L.push('> 请先读「数据口径与局限」一节再解读数字。');
+  L.push('');
+
+  /* ---- 1. 基本信息 ---- */
+  L.push('## 一、基本信息');
+  L.push('');
+  const info = [
+    ['名称', d.name], ['代码', d.code], ['基金类型', d.fund_type],
+    ['股票仓位', d.equity_ratio != null ? fmt(d.equity_ratio, 1) + '%' : null],
+    ['A股/港股/其他', `${d.n_a} / ${d.n_hk} / ${d.n_oversea} 只`],
+  ];
+  if (d.n_hk) {
+    info.push(['港股权重', d.hk_weight != null ? fmt(d.hk_weight, 2) + '%' : null]);
+    info.push(['港股口径', 'PE 由 当日总市值 ÷ TTM股东应占溢利 自算，财报为半年度']);
+  }
+  info.push(
+    ['持仓报告期', d.report_date], ['最新财报期', d.fin_period],
+    ['PE 数据日', d.pe_date], ['增速口径', mode === 'ttm'
+      ? 'TTM（滚动12个月 vs 去年同期，稳健）' : '最新报告期累计同比（灵敏）'],
+    ['生成时间', now.toLocaleString('zh-CN')]);
+  if (extra && extra.mcap != null) info.push(['基金规模', fmt(extra.mcap / 1e8, 1) + ' 亿元']);
+  if (extra && extra.pctDay != null) info.push(['当日涨跌', fmt(extra.pctDay, 2) + '%']);
+  info.forEach(([k, v]) => L.push(`- ${k}：${v == null || v === '' ? '—' : v}`));
+  L.push('');
+
+  /* ---- 2. 核心结论 ---- */
+  L.push('## 二、核心结论');
+  L.push('');
+  L.push('| 指标 | 数值 | 说明 |');
+  L.push('|---|---|---|');
+  const rows = [
+    ['PEG（整体法）', fmt(d.peg, 3), 'PE ÷ 增速，本工具主指标'],
+    ['PE-TTM（整体法）', fmt(d.pe, 2), 'Σ持仓市值 ÷ Σ归母净利润'],
+    ['归母净利增速（TTM）', fmt(d.g_ttm, 2) + '%', '滚动12个月同比'],
+    ['归母净利增速（最新报告期累计）', fmt(d.g_latest, 2) + '%', '本期累计 vs 去年同期累计'],
+    ['全样本增速（含负增长）', fmt(d.g_all, 2) + '%',
+      d.g_all != null && gUsed != null
+        ? `与有效样本增速差 ${(gUsed - d.g_all).toFixed(1)}pct，即剔除负增长带来的选择性偏差`
+        : '含亏损与负增长成分股'],
+    ['PEG（中位数法）', fmt(d.peg_median, 3), '抗极端值的稳健参照'],
+    ['PEG（权重加权平均）', fmt(d.peg_weighted_avg, 3), '成分股 PEG 加权平均，易被极端值带偏'],
+    ['有效样本覆盖率', fmt(d.coverage, 1) + '%', `${d.n_valid}/${d.n_total} 只参与计算`],
+    ['有效样本', `${d.n_valid} / ${d.n_total}`, '正 PE 且正增长的成分股'],
+  ];
+  rows.forEach(([k, v, n]) => L.push(`| ${k} | ${v} | ${n} |`));
+  L.push('');
+
+  /* ---- 3. 近一年财报摘要 ---- */
+  const fin = gs.slice(0, 4);
+  if (fin.length) {
+    L.push('## 三、近一年财报摘要（组合层面，绝对量 + 增速）');
+    L.push('');
+    L.push('| 报告期 | 类型 | 组合TTM归母净利(亿元) | 去年同期(亿元) | 全样本增速% | 正增长样本增速% | 样本 |');
+    L.push('|---|---|---|---|---|---|---|');
+    fin.forEach(s => L.push(
+      `| ${s.period} | ${s.label} | ${s.np_now != null ? fmt(s.np_now / 1e8, 1) : '—'}`
+      + ` | ${s.np_prev != null ? fmt(s.np_prev / 1e8, 1) : '—'}`
+      + ` | ${fmt(s.g, 2)} | ${fmt(s.g_valid, 2)} | ${s.vused}/${s.used} |`));
+    L.push('');
+  }
+
+  /* ---- 4. 增速序列 ---- */
+  if (gs.length) {
+    L.push('## 四、组合增速序列（近 ' + gs.length + ' 个报告期）');
+    L.push('');
+    L.push('| 报告期 | 类型 | 全样本增速% | 正增长样本增速% | 样本 |');
+    L.push('|---|---|---|---|---|');
+    gs.forEach(s => L.push(`| ${s.period} | ${s.label} | ${fmt(s.g, 2)} | ${fmt(s.g_valid, 2)} | ${s.vused}/${s.used} |`));
+    L.push('');
+  }
+
+  /* ---- 5. 当前持仓 ---- */
+  const N = 100;
+  const list = (d.stocks || []).slice(0, N);
+  const rest = (d.stocks || []).slice(N);
+  const restW = rest.reduce((a, s) => a + (s.weight || 0), 0);
+  if (list.length) {
+    L.push(`## 五、当前持仓（按权重降序，前 ${list.length} 只）`);
+    L.push('');
+    L.push('| 代码 | 名称 | 市场 | 权重% | 股价 | PE-TTM | 增速% | PEG | 财报期 | 状态 |');
+    L.push('|---|---|---|---|---|---|---|---|---|---|');
+    list.forEach(s => L.push(
+      `| ${s.code} | ${s.name} | ${mktTag(s)} | ${fmt(s.weight, 2)}`
+      + ` | ${fmt(s.price, 2)} | ${fmt(s.pe_ttm, 2)}`
+      + ` | ${fmt(mode === 'ttm' ? s.g_ttm : s.g_latest, 2)} | ${fmt(s.peg, 3)}`
+      + ` | ${s.fin_period || '—'} | ${STATUS_CN[s.status] || s.status} |`));
+    if (rest.length) {
+      L.push(`| — | 其余 ${rest.length} 只 | — | ${fmt(restW, 2)} | — | — | — | — | — | 未单列 |`);
+    }
+    L.push('');
+  }
+
+  /* ---- 6. 历史月度估值 ---- */
+  L.push('## 六、历史月度估值' + (months.length ? `（${months.length} 个月）` : ''));
+  L.push('');
+  if (months.length) {
+    L.push('| 月末 | PE-TTM | PE区间 | 增速% | PEG | PEG区间 | 覆盖率% |');
+    L.push('|---|---|---|---|---|---|---|');
+    months.forEach(m => L.push(
+      `| ${m.date} | ${fmt(m.pe, 2)}`
+      + ` | ${fmt(m.pe_lo, 2)}~${fmt(m.pe_hi, 2)}`
+      + ` | ${fmt(m.g_ttm, 2)} | ${fmt(m.peg, 3)}`
+      + ` | ${m.peg_lo != null ? fmt(m.peg_lo, 3) + '~' + fmt(m.peg_hi, 3) : '—'}`
+      + ` | ${fmt(m.coverage, 1)} |`));
+    if (months.length < 12) {
+      L.push('');
+      L.push(`> 注意：本基金当前仅缓存 ${months.length} 个月的月度估值，`
+        + `在工具界面执行「回填历史」可覆盖 2018 年以来的全部区间。`);
+    }
+  } else {
+    L.push('> 该基金暂无历史月度数据。在工具界面执行「回填历史」后，'
+      + '这里会给出 2018 年以来逐月的 PE / 增速 / PEG。');
+  }
+  L.push('');
+
+  /* ---- 7. 口径与局限 ---- */
+  L.push('## 七、数据口径与局限（解读前必读）');
+  L.push('');
+  L.push('### 口径');
+  L.push('');
+  L.push('- PE 与增速均为**整体法**：PE = Σ持股权重×市值 ÷ Σ归母净利润（按持股权重加权的调和平均），不是成分股 PE 的简单平均，也非中位数');
+  L.push('- 增速为 **TTM 口径**：滚动 12 个月归母净利润 vs 去年同期滚动 12 个月');
+  L.push('- **只统计 PE>0 且增速>0 的成分股**（表中「有效样本」），因此有效样本增速通常高于全样本增速，PEG 会偏乐观；两者之差即选择性偏差的大小');
+  L.push('- 个股财报按**真实披露日**对齐（point-in-time），避免用到尚未公开的数据');
+  L.push('- A 股 PE 为东财 PE-TTM 口径；**港股无现成历史 PE，由 当日总市值 ÷ TTM股东应占溢利 自算**，且港股财报为半年度（中报/年报），更新节奏比 A 股慢半年');
+  L.push('- 月度估值的数值取该月**最后一个交易日**，区间为该月最高/最低');
+  L.push('- PEG = PE ÷ 增速。PEG<1 只是传统经验值，需结合增速可持续性、行业景气与上述偏差综合判断');
+  L.push('');
+  L.push('### 局限');
+  L.push('');
+  L.push('- 持仓来自**定期报告**（季报前十大 / 半年报与年报全持仓），非实时，滞后最长可达一个季度以上；主动型基金季度间可能大幅调仓');
+  L.push('- PE-TTM 数据滞后 1~2 个交易日');
+  if (d.warn) {
+    L.push('- 本基金特有的提示：' + d.warn);
+  }
+  L.push('- 本数据仅为估值参考，不构成任何投资建议');
+  L.push('');
+  return L.join('\n');
+}
+
+async function ensureAiHist(code) {
+  if (HIST.daily && HIST.daily.length >= 2) return HIST;
+  const j = await api(`/api/history?code=${code}&years=10&by=all`);
+  if (j.ok && j.data && j.data.daily) {
+    HIST = { daily: j.data.daily, by_year: j.data.by_year || [],
+             by_quarter: j.data.by_quarter || [], by_month: j.data.by_month || [] };
+  }
+  return HIST;
+}
+
+async function getAiReport() {
+  if (!CUR) throw new Error('尚未完成分析');
+  const h = await ensureAiHist(CUR.code);
+  const e = ALL.find(x => x.code === CUR.code);
+  return buildAiReport(CUR, h, { mcap: e ? e.market_cap : null, pctDay: e ? e.pct : null });
+}
+
+async function copyAiReport(btn) {
+  btn.disabled = true;
+  try {
+    const text = await getAiReport();
+    let ok = false;
+    try { await navigator.clipboard.writeText(text); ok = true; } catch (e) { /* 降级 */ }
+    if (!ok) {                                   // http 环境（127.0.0.1 非 https）常见
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      ta.remove();
+    }
+    btn.textContent = ok ? '已复制 ✓' : '复制失败，请用下载';
+    setTimeout(() => { btn.textContent = '复制给 AI'; btn.disabled = false; }, 1600);
+  } catch (e) {
+    btn.textContent = '复制失败';
+    setTimeout(() => { btn.textContent = '复制给 AI'; btn.disabled = false; }, 1600);
+  }
+}
+
+function downloadAiReport(btn) {
+  btn.disabled = true;
+  try {
+    getAiReport().then(text => {
+      const safe = (CUR.name || CUR.code).replace(/[\\/:*?"<>|]/g, '');
+      const ymd = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([text], {type: 'text/markdown;charset=utf-8'}));
+      a.download = `${CUR.code}_${safe}_AI数据_${ymd}.md`;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+      btn.textContent = '已下载 ✓';
+      setTimeout(() => { btn.textContent = '下载 .md'; btn.disabled = false; }, 1600);
+    }).catch(e => {
+      btn.textContent = '下载失败';
+      setTimeout(() => { btn.textContent = '下载 .md'; btn.disabled = false; }, 1600);
+    });
+  } catch (e) {
+    btn.textContent = '下载失败';
+    btn.disabled = false;
+  }
+}
+
+$('#aiCopyBtn').onclick = e => copyAiReport(e.currentTarget);
+$('#aiDlBtn').onclick = e => downloadAiReport(e.currentTarget);
+
+/* 柱状图：按年/季/月，可切指标 */
+function drawHist() {
+  const box = $('#r-chart'), body = $('#chartBody');
+  const by = $('#histBy').value, metric = $('#histMetric').value;
+  let rows = HIST['by_' + by] || [];
+  if (!rows.length && HIST.daily && HIST.daily.length >= 2) {
+    // 旧数据没有预聚合，前端自己聚（桶末值）
+    const key = d => by === 'year' ? d.slice(0, 4)
+      : by === 'quarter' ? d.slice(0, 4) + 'Q' + ((+d.slice(5, 7) - 1) / 3 + 1)
+      : d.slice(0, 7);
+    const m = new Map();
+    for (const r of HIST.daily) { m.set(key(r.date), r); }
+    rows = [...m.entries()].map(([k, r]) => ({ ...r, key: k }));
+  }
+  if (rows.length < 2) { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+  rows = rows.slice().sort((a, b) => a.key < b.key ? -1 : 1);
+
+  const W = 920, H = 260, PL = 44, PR = 10, PT = 16, PB = 34;
+  const vals = rows.map(r => r[metric]).filter(v => v != null && isFinite(v));
+  if (!vals.length) { body.innerHTML = '<div class="empty">无数据</div>'; return; }
+  const lo = Math.min(...vals, 0), hi = Math.max(...vals);
+  const rng = (hi - lo) || 1;
+  const y = v => PT + (H - PT - PB) * (1 - (v - lo) / rng);
+  const iw = (W - PL - PR) / rows.length;
+  const bw = Math.max(4, Math.min(56, iw * 0.62));
+  const MNAME = { peg: 'PEG', pe: 'PE-TTM', g_ttm: '增速%' };
+
+  let bars = '', labels = '', grid = '';
+  for (let gy = 0; gy <= 4; gy++) {
+    const v = lo + rng * gy / 4, yy = y(v);
+    grid += `<line x1="${PL}" x2="${W - PR}" y1="${yy}" y2="${yy}" stroke="#2a3140" stroke-dasharray="2 4"/>`
+      + `<text x="${PL - 6}" y="${yy + 4}" fill="#8b949e" font-size="11" text-anchor="end">${v.toFixed(Math.abs(hi) < 10 ? 1 : 0)}</text>`;
+  }
+  rows.forEach((r, i) => {
+    const v = r[metric];
+    const cx = PL + iw * i + iw / 2;
+    if (v != null && isFinite(v)) {
+      const y0 = y(0), y1 = y(v);
+      const up = v >= 0;
+      const col = metric === 'g_ttm'
+        ? (up ? '#3fb950' : '#f85149')
+        : (up ? '#4f9cf9' : '#f85149');
+      bars += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${Math.min(y0, y1).toFixed(1)}"`
+        + ` width="${bw.toFixed(1)}" height="${Math.max(1, Math.abs(y1 - y0)).toFixed(1)}"`
+        + ` fill="${col}" rx="2"><title>${r.key}｜${MNAME[metric]} ${v.toFixed(metric === 'peg' ? 3 : 2)}`
+        + (metric !== 'g_ttm' ? `｜区间 ${r.pe_lo != null ? r.pe_lo.toFixed(2) : '—'}~${r.pe_hi != null ? r.pe_hi.toFixed(2) : '—'}` : '')
+        + `｜持仓期 ${r.report_date || '—'}｜${r.days || 1} 个交易日</title></rect>`;
+    }
+    const step = Math.ceil(rows.length / 24);
+    if (i % step === 0) {
+      labels += `<text x="${cx}" y="${H - PB + 16}" fill="#8b949e" font-size="10.5"`
+        + ` text-anchor="end" transform="rotate(-38 ${cx} ${H - PB + 16})">${r.key}</text>`;
+    }
+  });
+  body.innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;display:block">${grid}${bars}${labels}</svg>`
+    + `<div class="muted" style="font-size:11.5px;margin-top:6px">
+         共 ${rows.length} 个${by === 'year' ? '年' : by === 'quarter' ? '季度' : '月'}；`
+    + `柱高取该${by === 'year' ? '年' : by === 'quarter' ? '季度' : '月'}<b>最后一个交易日</b>的值，悬停可见区间极值。
+         上游个股每日 PE 最早 2018-01-02，更早无法回填。
+       </div>`;
+}
+
+/* 每日明细表（保留，取最近 12 条） */
+function renderDaily() {
+  const box = $('#r-history'), body = $('#r-hist-body');
+  const rows = HIST.daily || [];
+  if (rows.length < 1) { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+  $('#r-hist-note').textContent = `共 ${rows.length} 个交易日（${rows[rows.length - 1].date} ~ ${rows[0].date}）`;
+  const tb = rows.slice(0, 12).map(r => `
+    <tr>
+      <td class="l mono">${r.date}</td>
+      <td>${fmt(r.pe)}</td>
+      <td class="${r.g_ttm > 0 ? 'g' : 'b'}">${pct(r.g_ttm, 1)}</td>
+      <td class="${cls(r.peg)}"><b>${fmt(r.peg, 3)}</b></td>
+      <td>${fmt(r.coverage, 0)}</td>
+      <td class="l muted">${r.report_date || '—'}</td>
+    </tr>`).join('');
+  body.innerHTML = `
+    <div class="tbl-wrap" style="max-height:260px">
+      <table>
+        <thead><tr>
+          <th class="l">日期</th><th>PE</th><th>增速%</th><th>PEG</th><th>覆盖%</th><th class="l">持仓期</th>
+        </tr></thead>
+        <tbody>${tb}</tbody>
+      </table>
+    </div>`;
+}
+
+/* ---------------- 本地数据库 ---------------- */
+async function loadStore() {
+  const el = $('#storeInfo');
+  try {
+    const s = (await api('/api/store')).data;
+    const rows = [
+      ['大小', `${s.db_size_mb} MB`],
+      ['历史财报', `${s.fin_rows.toLocaleString()} 条 / ${s.fin_periods} 期`
+        + (s.fin_settled ? `（${s.fin_settled} 期已定稿，永不重下）` : '')],
+      ['基金持仓', `${s.holdings_rows.toLocaleString()} 条 / ${s.holdings_reports} 份报告 / ${s.holdings_etf} 只 ETF`],
+      ['ETF 名录', `${s.etf_list_rows} 只`],
+      ['PEG 每日快照', s.daily_from
+        ? `${s.daily_rows.toLocaleString()} 条（${s.daily_from} ~ ${s.daily_to}）` : '暂无'],
+      ['个股历史 PE', s.stock_pe_rows
+        ? `${s.stock_pe_rows.toLocaleString()} 条 / ${s.stock_pe_codes} 只`
+          + (s.stock_pe_range && s.stock_pe_range[0]
+             ? `（${s.stock_pe_range[0]} ~ ${s.stock_pe_range[1]}）` : '') : '暂无'],
+      ['港股库（独立）', s.hk
+        ? `${s.hk.db_size_mb} MB　${s.hk.fin_rows.toLocaleString()} 条财报`
+          + ` / ${s.hk.stock_pe_rows.toLocaleString()} 条日行情`
+          + (s.hk.stock_pe_codes ? ` / ${s.hk.stock_pe_codes} 只` : '') : '暂无'],
+    ];
+    el.innerHTML = rows.map(([k, v]) =>
+      `<div style="display:flex;gap:10px;padding:3px 0">
+         <span style="color:var(--dim);min-width:104px">${k}</span><span>${v}</span>
+       </div>`).join('')
+      + `<div style="margin-top:8px;color:var(--dim)">A 股库：${s.db_path}</div>`
+      + (s.hk ? `<div style="color:var(--dim)">港股库：${s.hk.db_path}</div>` : '');
+  } catch (e) {
+    el.textContent = '读取本地数据库失败';
+  }
+}
+$('#storeBtn').onclick = loadStore;
+loadStore();
+
+/* ---------------- 全市场初始化（A 股 / 港股共用一套逻辑） ---------------- */
+async function loadCov(url, elId, fallbackHtml) {
+  try {
+    const d = (await api(url)).data || {};
+    const p = d.total ? (d.done / d.total * 100) : 0;
+    $('#' + elId).innerHTML =
+      `已拉取 <b>${d.done || 0}</b> / <b>${d.total || 0}</b> 只（${p.toFixed(1)}%）`
+      + `　共 ${(d.rows || 0).toLocaleString()} 行`
+      + (d.snapshot_date ? `　清单日期 ${d.snapshot_date}` : '')
+      + (d.total && d.done >= d.total ? '　✅ 已完成' : '');
+  } catch (e) {
+    if (fallbackHtml) $('#' + elId).innerHTML = fallbackHtml;
+  }
+}
+
+function bindInit(kind, btnId, cancelId, barId, covId, covUrl) {
+  const enter = () => {
+    $('#' + btnId).disabled = true;
+    $('#' + cancelId).style.display = '';
+    $('#' + cancelId).disabled = false;
+    $('#' + barId).style.display = 'block';
+  };
+  const onTick = d => {
+    $('#' + barId).querySelector('i').style.width = (d.pct || 0) + '%';
+    $('#' + covId).innerHTML =
+      `<span class="spinner"></span> ${(d.pct || 0).toFixed(1)}%　${d.stage || ''}`
+      + (d.total ? `（${d.done}/${d.total} 只）` : '');
+  };
+  const onDone = (d, err) => {
+    $('#' + barId).style.display = 'none';
+    $('#' + cancelId).style.display = 'none';
+    $('#' + btnId).disabled = false;
+    // 错误信息必须直接写：走 loadCov 的话它请求一成功就会把错误覆盖掉，
+    // 用户只看到「闪一下」。
+    if (err) {
+      $('#' + covId).innerHTML =
+        `<span style="color:var(--bad)">启动失败：${err.message}</span>`;
+      return;
+    }
+    if (d && d.error) {
+      $('#' + covId).innerHTML =
+        `<span style="color:var(--bad)">初始化失败：${d.error}</span>`;
+      return;
+    }
+    loadStore();
+    loadCov(covUrl, covId);
+  };
+
+  JOB_RESUME[kind] = () => { enter(); attachJob(kind, onTick, onDone); };
+  $('#' + btnId).onclick = () => {
+    enter();
+    $('#' + barId).querySelector('i').style.width = '0%';
+    startJob(kind, 'kind=' + kind, onTick, onDone);
+  };
+  $('#' + cancelId).onclick = () => {
+    fetch('/api/job/cancel');
+    $('#' + cancelId).disabled = true;
+    $('#' + covId).innerHTML = '<span class="spinner"></span> 正在取消…';
+  };
+}
+
+bindInit('initpe', 'initBtn', 'initCancelBtn', 'initBar', 'peCov', '/api/pe-coverage');
+bindInit('inithk', 'initHkBtn', 'initHkCancelBtn', 'initHkBar', 'hkCov', '/api/hk-coverage');
+loadCov('/api/pe-coverage', 'peCov');
+loadCov('/api/hk-coverage', 'hkCov');
+
+/* 刷新页面后，服务端的任务可能还在跑（前端状态全丢了）。
+   这里主动查一次，把 UI 直接接回去——不用等用户再点一次按钮。 */
+(async () => {
+  try {
+    const st = (await api('/api/job/status')).data;
+    if (st && st.running && JOB_RESUME[st.kind]) JOB_RESUME[st.kind]();
+  } catch (e) { /* 取不到就罢了，用户点按钮也能接管 */ }
+})();
+
+/* 打开页面先自检一次连通性，避免等到点击某只 ETF 才暴露问题。
+   本机不通时再自动探测另一个主机名（127.0.0.1 ↔ localhost）：
+   很多代理的放行名单只写了其中一个，换一个就能通。 */
+(async () => {
+  const el = $('#connWarn');
+  try {
+    await api('/api/ping');
+    return;
+  } catch (e) {
+    el.style.display = 'block';
+    el.textContent = '⚠ 无法与本地服务通信：' + e.message;
+  }
+
+  const alt = location.hostname === '127.0.0.1' ? 'localhost'
+            : location.hostname === 'localhost' ? '127.0.0.1' : null;
+  if (!alt) return;
+  const url = `${location.protocol}//${alt}:${location.port}/`;
+  try {
+    const r = await fetch(`${url}api/ping`, {cache: 'no-store'});
+    const ok = r.ok && (await r.json()).ok === true;
+    if (ok) {
+      el.innerHTML = '⚠ 当前地址访问不到本地服务，但换用另一个主机名可以连通。'
+        + ` 请点击：<a href="${url}" style="color:#7ee787">${url}</a>`;
+    }
+  } catch (e) { /* 两个都不通，保留原提示 */ }
+})();
+
+/* 单元格里的迷你走势条（近 9 期增速） */
+function miniSeries(vals) {
+  if (!vals || !vals.length) return '<span class="muted" style="font-size:11px">—</span>';
+  const v = vals.filter(x => x !== null && x !== undefined);
+  const rng = (Math.max(...v, 0) - Math.min(...v, 0)) || 1;
+  const lo = Math.min(...v, 0);
+  return `<span style="display:inline-flex;align-items:flex-end;gap:1px;height:18px"
+            title="${vals.map((x, i) => `#${i + 1} ${x === null ? '—' : x.toFixed(1) + '%'}`).join('  ')}">`
+    + vals.map(x => x === null || x === undefined
+      ? `<i style="width:4px;height:1px;background:#3a4150"></i>`
+      : `<i style="width:4px;height:${Math.max(2, Math.round((x - lo) / rng * 16))}px;`
+        + `background:${x >= 0 ? '#3fb950' : '#f85149'}"></i>`).join('')
+    + '</span>';
+}
+
+/* 点击展开：该只股票近 9 期的增速明细 */
+function toggleSeries(code) {
+  if (!CUR) return;
+  const s = CUR.stocks.find(x => x.code === code);
+  if (!s || !s.g_series) return;
+  const bases = (CUR.fin_basis && CUR.fin_basis.series_bases) || [];
+  const old = document.getElementById('ser-' + code);
+  if (old) { old.remove(); return; }
+  const tr = document.createElement('tr');
+  tr.id = 'ser-' + code;
+  tr.innerHTML = `<td colspan="11" style="background:#12171f;padding:10px 14px">
+      <div style="font-size:12px;margin-bottom:6px">
+        <b>${s.name}（${code}）</b> 近 ${s.g_series.length} 个报告期的 TTM 归母净利同比
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        ${s.g_series.map((v, i) => `
+          <div style="min-width:74px;padding:5px 8px;background:#1c2230;border-radius:6px;
+                      border:1px solid #2a3140">
+            <div style="color:var(--dim);font-size:10.5px">${bases[i] || '#' + (i + 1)}</div>
+            <div style="font-size:13px;font-weight:600;color:${v === null ? '#8b949e' : (v >= 0 ? '#3fb950' : '#f85149')}">
+              ${v === null ? '—' : v.toFixed(1) + '%'}
+            </div>
+          </div>`).join('')}
+      </div>
+      <div class="muted" style="margin-top:6px;font-size:11px">
+        当前这行采用的报告：${s.fin_label || '—'}（披露日 ${s.fin_date || '—'}）
+      </div>
+    </td>`;
+  const row = [...document.querySelectorAll('#r-tbl tbody tr')]
+    .find(r => r.children[0] && r.children[0].textContent.trim() === code);
+  if (row) row.after(tr);
+}
+
+function drawTable(d) {
+  const mode = $('#mode').value;
+  const rows = d.stocks.map(s => ({...s, g: mode === 'ttm' ? s.g_ttm : s.g_latest}));
+  rows.sort((a, b) => {
+    const x = a[SORT.k], y = b[SORT.k];
+    if (x === null || x === undefined) return 1;
+    if (y === null || y === undefined) return -1;
+    return (x - y) * (SORT.asc ? 1 : -1);
+  });
+  const ST = {ok: ['ok', '有效'], no_pe: ['no', 'PE无效'], no_growth: ['no', '增速≤0/缺失'],
+              no_quote: ['no', '无行情'], no_data: ['no', '无数据'],
+              oversea: ['no', '港股/美股']};
+  $('#r-tbl').querySelector('tbody').innerHTML = rows.map(s => {
+    const [c, t] = ST[s.status] || ['', s.status];
+    return `<tr>
+      <td class="l mono">${s.code}</td>
+      <td class="l">${s.name}</td>
+      <td>${fmt(s.weight)}</td>
+      <td>${fmt(s.price)}</td>
+      <td>${fmt(s.pe_ttm)}</td>
+      <td class="${s.g > 0 ? 'g' : (s.g !== null ? 'b' : '')}">${pct(s.g, 1)}</td>
+      <td class="${cls(s.peg)}">${s.peg ? fmt(s.peg) : '—'}</td>
+      <td class="l mono" style="font-size:12px" title="${s.fin_label || ''}">${s.fin_label || '—'}</td>
+      <td class="l mono" style="font-size:12px;color:var(--dim)">${s.fin_date || '—'}</td>
+      <td class="l" style="cursor:pointer" onclick="toggleSeries('${s.code}')">
+        ${miniSeries(s.g_series)}
+      </td>
+      <td class="l"><span class="tag ${c}">${t}</span></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="11" class="empty">无成分股数据</td></tr>';
+}
+document.querySelectorAll('#r-tbl th[data-s]').forEach(th => th.onclick = () => {
+  const k = th.dataset.s;
+  SORT = {k, asc: SORT.k === k ? !SORT.asc : false};
+  if (CUR) drawTable(CUR);
+});
+$('#mode').onchange = () => { if (picked) analyze(picked.code); };
+
+/* ---------------- 排行扫描 ---------------- */
+let scanTimer = null;
+$('#scanBtn').onclick = async () => {
+  $('#scanBtn').disabled = true;
+  $('#cancelBtn').style.display = '';
+  $('#scanBar').style.display = 'block';
+  $('#scanBar').querySelector('i').style.width = '0%';
+  $('#scanInfo').innerHTML = '<span class="spinner"></span> 排队中…';
+  // 先起轮询再发启动请求：即使启动请求慢，进度也不会假死
+  clearInterval(scanTimer);
+  scanTimer = setInterval(pollScan, 1000);
+  pollScan();
+  try {
+    await fetch(`/api/scan/start?limit=${$('#scanLimit').value}&mode=${$('#mode').value}`);
+  } catch (e) {
+    $('#scanInfo').innerHTML = `<span style="color:var(--bad)">启动失败：${e.message}</span>`;
+    clearInterval(scanTimer);
+    $('#scanBtn').disabled = false;
+    $('#cancelBtn').style.display = 'none';
+  }
+};
+$('#cancelBtn').onclick = () => {
+  fetch('/api/scan/cancel');
+  $('#cancelBtn').disabled = true;
+  $('#scanInfo').innerHTML = '<span class="spinner"></span> 正在取消…';
+};
+
+let SCANDATA = [];
+async function pollScan() {
+  let d;
+  try {
+    d = (await api('/api/scan/status')).data;
+  } catch (e) { return; }
+
+  if (d.error) {
+    clearInterval(scanTimer);
+    $('#scanInfo').innerHTML = `<span style="color:var(--bad)">出错：${d.error}</span>`;
+    endScan();
+    return;
+  }
+  if (d.running) {
+    const p = d.total ? Math.round(d.done / d.total * 100) : 0;
+    $('#scanBar').querySelector('i').style.width = p + '%';
+    // 准备阶段（拉行情/财报/持仓）没有 done，显示 stage 文本，避免停在「初始化」
+    $('#scanInfo').innerHTML = d.done
+      ? `<span class="spinner"></span> ${d.done}/${d.total} 正在分析 ${d.current}`
+      : `<span class="spinner"></span> ${d.stage || '准备中…'}`;
+    return;
+  }
+
+  clearInterval(scanTimer);
+  endScan();
+  SCANDATA = d.results || [];
+  if (!SCANDATA.length) {
+    $('#scanInfo').textContent = d.stage === '已取消' ? '已取消扫描' : '未获取到结果';
+    return;
+  }
+  $('#scanBar').querySelector('i').style.width = '100%';
+  $('#scanInfo').textContent = `扫描完成，共 ${SCANDATA.length} 只（点击表头排序）`;
+  $('#scanWrap').style.display = 'block';
+  drawScan('peg', true);
+}
+function endScan() {
+  $('#scanBtn').disabled = false;
+  $('#cancelBtn').style.display = 'none';
+  $('#cancelBtn').disabled = false;
+}
+let SK = {k: 'peg', asc: true};
+function drawScan(k, asc) {
+  SK = {k, asc};
+  const mode = $('#mode').value;
+  const rows = SCANDATA.filter(r => r.peg !== null && r.peg !== undefined).map(r => ({
+    ...r, g: mode === 'ttm' ? r.g_ttm : r.g_latest
+  }));
+  rows.sort((a, b) => {
+    const x = a[k], y = b[k];
+    if (x === null || x === undefined) return 1;
+    if (y === null || y === undefined) return -1;
+    return (x - y) * (asc ? 1 : -1);
+  });
+  $('#scanTbl').querySelector('tbody').innerHTML = rows.map(r => `
+    <tr>
+      <td class="l"><a href="#" onclick="analyze('${r.code}');return false">${r.name}</a></td>
+      <td class="l mono">${r.code}</td>
+      <td>${fmt(r.pe)}</td>
+      <td class="${r.g > 0 ? 'g' : 'b'}">${pct(r.g, 1)}</td>
+      <td class="${cls(r.peg)}"><b>${fmt(r.peg)}</b></td>
+      <td class="${r.coverage >= 70 ? 'g' : (r.coverage >= 50 ? 'w' : 'b')}">${fmt(r.coverage, 0)}</td>
+      <td>${r.n_valid}/${r.n_total}</td>
+      <td class="l muted">${r.report_date || '—'}</td>
+    </tr>`).join('') || '<tr><td colspan="8" class="empty">无有效结果</td></tr>';
+}
+document.querySelectorAll('#scanTbl th[data-k]').forEach(th => th.onclick = () => {
+  const k = th.dataset.k;
+  drawScan(k, SK.k === k ? !SK.asc : true);
+});
+</script>
+</body>
+</html>
