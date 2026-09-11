@@ -248,11 +248,27 @@ def quarterly_growth(codes: List[str], bases: List[str],
       series    = [{period, label, g, used, total, pe?}]  组合口径（整体法）
       per_stock = {code: [g_or_None, ...]}                每只股票的逐期增速
     """
-    # 逐期只取成分股的数据，避免把全市场读进内存
+    # 逐期只取成分股的数据，避免把全市场读进内存。
+    # A 股财报在 A 股库、港股财报在港股库（5 位代码），必须各查各的再合并；
+    # 只查 A 股库的话，含港股的基金近 N 期增速里港股一行全是空。
+    hk_codes = [c for c in codes if store.market_of(None, c) is store.HK]
+    a_codes = [c for c in codes if c not in set(hk_codes)]
+    periods = sorted({dp for b in bases for dp in ds.ttm_required_periods(b)},
+                     reverse=True)
     fin: Dict[str, Dict[str, dict]] = {}
-    for p in sorted({dp for b in bases for dp in ds.ttm_required_periods(b)},
-                    reverse=True):
-        fin[p] = store.load_fin_subset(p, codes)
+    for p in periods:
+        merged = store.load_fin_subset(p, a_codes)
+        if hk_codes and p.endswith(("-06-30", "-12-31")):
+            # 港股只有中报/年报，一季报/三季报期直接跳过，别白打请求。
+            # fetch_hk_financials 自带本地库缓存：已入库的期零网络开销，
+            # 缺失的期自动补拉入库（与 A 股 ensure_series_periods 同一思路）。
+            try:
+                got = hk.fetch_hk_financials(p)
+            except Exception:                               # noqa: BLE001
+                got = None
+            if got:
+                merged.update({c: got[c] for c in hk_codes if c in got})
+        fin[p] = merged
 
     series, per = [], {c: [] for c in codes} if with_stocks else None
     for p in bases:

@@ -3,7 +3,7 @@
 数据源模块 —— 全部来自免费公开接口，无需注册、无积分、无限额（注意控制频率）。
 
 四类数据：
-  1. ETF 列表        东方财富 push2       fs=b:MK0021
+  1. ETF 列表        东方财富 push2       fs=b:MK0021,b:MK0023（境内 + 跨境 ETF）
   2. ETF 全持仓      天天基金 fundf10     type=jjcc    （季度更新，含权重）
   3. 个股实时 PE-TTM 东方财富 push2       clist/get f9 / stock/get f162
   4. 归母净利润      东方财富 datacenter  RPT_LICO_FN_CPD（全市场批量，含同比）
@@ -159,12 +159,17 @@ def cache_put(key: str, value: object) -> None:
 # --------------------------------------------------------------------------- #
 #  1. ETF 列表
 # --------------------------------------------------------------------------- #
-_ETF_BACKUP = "etf_list_backup"
+# 关键：东财把场内基金拆成多个板块，跨境 ETF（恒生科技/港股通/中概互联/纳指等）
+# 不在 b:MK0021（境内股票 ETF）里，而在 b:MK0023（跨境 ETF，约 240 只）。
+# 只拉 MK0021 的话，搜索框里就搜不到港股类 ETF，只能搜到场外 QDII 基金号码。
+# 货币(MK0022)/商品(MK0024)无股票持仓，本工具用不上，不拉。
+_ETF_LIST_KEY = "etf_list_v2"        # v2 = 换 fs 后弃用旧缓存，避免读到旧的纯境内列表
+_ETF_BACKUP = "etf_list_backup_v2"
 
 
 def fetch_etf_list(force: bool = False) -> List[dict]:
-    """返回 [{code, name, price, pct, market_cap}]，共 1300+ 只场内 ETF。"""
-    key = "etf_list"
+    """返回 [{code, name, price, pct, market_cap}]，共 1500+ 只场内 ETF（含跨境）。"""
+    key = _ETF_LIST_KEY
     if not force:
         hit = cache_get(key, 600)
         if hit:
@@ -197,10 +202,11 @@ def fetch_etf_list(force: bool = False) -> List[dict]:
 def _paginate() -> List[dict]:
     out: List[dict] = []
     page, size = 1, 100
+    seen: set = set()
     while True:
         params = {
             "pn": str(page), "pz": str(size), "po": "0", "np": "1",
-            "fltt": "2", "invt": "2", "fid": "f12", "fs": "b:MK0021",
+            "fltt": "2", "invt": "2", "fid": "f12", "fs": "b:MK0021,b:MK0023",
             "fields": "f12,f14,f2,f3,f21",
         }
         url = "https://push2.eastmoney.com/api/qt/clist/get?" + urllib.parse.urlencode(params)
@@ -210,6 +216,9 @@ def _paginate() -> List[dict]:
         for it in data["diff"]:
             if not it.get("f12"):
                 continue
+            if it["f12"] in seen:          # 板块间可能有少量重叠，按代码去重
+                continue
+            seen.add(it["f12"])
             out.append({
                 "code": it["f12"],
                 "name": it["f14"],

@@ -26,7 +26,7 @@ python run.py --cli 512480 --mode latest
 
 | 需求 | 来源 | 接口 | 更新频率 |
 |---|---|---|---|
-| ETF 列表（1300+ 只） | 东方财富 push2 | `clist/get?fs=b:MK0021` | 实时 |
+| ETF 列表（1500+ 只，境内+跨境） | 东方财富 push2 | `clist/get?fs=b:MK0021,b:MK0023` | 实时 |
 | ETF 全部持仓 + 权重 | 天天基金 fundf10 | `FundArchivesDatas.aspx?type=jjcc` | **季度**（半年报/年报为全持仓） |
 | 个股实时 PE-TTM / 市值 | 东方财富 push2 | `clist/get` 字段 `f9`（市盈率动态） | 实时 |
 | 归母净利润 / 同比增速 | 东方财富 datacenter | `RPT_LICO_FN_CPD` | 季度 |
