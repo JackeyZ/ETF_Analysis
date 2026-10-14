@@ -109,13 +109,21 @@ class Store:
                 name TEXT, parent_np REAL, np_yoy REAL, revenue REAL, rev_yoy REAL,
                 eps REAL, roe REAL, report_date TEXT,
                 currency TEXT, shares REAL,
+                -- 估值扩展列（主要港股用；A 股源接口没有这些字段，保持 NULL）
+                bps REAL, equity REAL, dividend_rate REAL, dps REAL,
+                total_liab REAL, end_cash REAL, op_profit REAL,
+                -- 港股财报类型（年报/中报/一季报/三季报）与财年截止（如 12-31/03-31），
+                -- 按公司财年构造 TTM 的依据；A 股源接口没有这两个字段，保持 NULL
+                report_type TEXT, fiscal_year TEXT,
                 PRIMARY KEY (period, code)
             ) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS ix_fin_period ON fin(period);
 
+            -- v2=1 表示该期财报已按扩展列重拉过（用于触发旧数据一次性升级）
             CREATE TABLE IF NOT EXISTS fin_period (
                 period TEXT PRIMARY KEY,
-                rows INTEGER, settled INTEGER DEFAULT 0, fetched_at TEXT
+                rows INTEGER, settled INTEGER DEFAULT 0, fetched_at TEXT,
+                v2 INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS holding (
@@ -143,9 +151,11 @@ class Store:
             );
 
             -- 个股每日估值（PE_TTM / 总市值）—— 历史数据，永久保存
+            -- pb/ps/pcf 与 PE 同源于东财估值库 RPT_VALUEANALYSIS_DET（一期起一并入库）
             CREATE TABLE IF NOT EXISTS stock_pe (
                 trade_date TEXT NOT NULL, code TEXT NOT NULL,
                 pe_ttm REAL, pe_lar REAL, mktcap REAL, close REAL,
+                pb REAL, ps REAL, pcf REAL,
                 PRIMARY KEY (trade_date, code)
             ) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS ix_pe_code ON stock_pe(code, trade_date);
@@ -166,22 +176,77 @@ class Store:
                 earliest_requested TEXT
             );
 
+            -- 机构一致预期（盈利预测，仅 A 股；TTL 由调用方按 fetched_at 控制）
+            CREATE TABLE IF NOT EXISTS cons_forecast (
+                code TEXT NOT NULL, year INTEGER NOT NULL,
+                mark TEXT, np REAL, np_ratio REAL, eps REAL, pe REAL,
+                n_org INTEGER, fetched_at TEXT,
+                PRIMARY KEY (code, year)
+            ) WITHOUT ROWID;
+
+            -- 中国 10 年期国债收益率（%）日序列（ERP 计算用）
+            CREATE TABLE IF NOT EXISTS bond_yield (
+                d TEXT PRIMARY KEY, y10 REAL
+            ) WITHOUT ROWID;
+
             CREATE TABLE IF NOT EXISTS etf_daily (
                 d TEXT NOT NULL, etf_code TEXT NOT NULL,
                 name TEXT, pe REAL, g_ttm REAL, g_all REAL, peg REAL, coverage REAL,
                 n_valid INTEGER, n_total INTEGER, report_date TEXT,
+                -- 一期起：多指标与历史分位（历史序列由回填增量填充）
+                pb REAL, ps REAL, div_yield REAL,
+                pe_pct REAL, pb_pct REAL, ps_pct REAL,
+                -- div_calc=1 表示该日股息率已按分红数据算过（纯成长股组合可能
+                -- 合法地为 NULL，不能用 div_yield 是否非空当完成标志）
+                div_calc INTEGER DEFAULT 0,
                 PRIMARY KEY (d, etf_code)
             ) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS ix_daily_etf ON etf_daily(etf_code, d);
+
+            -- 个股历史分红（每股派息，元）：除息日 + 派息额。既成事实，永久保存。
+            CREATE TABLE IF NOT EXISTS stock_div (
+                code TEXT NOT NULL, ex_date TEXT NOT NULL, dps REAL,
+                report_date TEXT, plan TEXT,
+                PRIMARY KEY (code, ex_date)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS ix_div_code ON stock_div(code, ex_date);
+
+            -- 分红拉取水位：该股已问过上游即记录，避免从未分红的股票每次重拉
+            CREATE TABLE IF NOT EXISTS div_fetch_log (
+                code TEXT PRIMARY KEY, requested_at TEXT
+            );
             """)
             cols = {r[1] for r in c.execute("PRAGMA table_info(fin)")}
             if "notice_date" not in cols:
                 c.execute("ALTER TABLE fin ADD COLUMN notice_date TEXT")
+            # 估值扩展列：老库一次性补齐（历史行 NULL，由重拉增量填充）
+            for _col in ("bps", "equity", "dividend_rate", "dps",
+                         "total_liab", "end_cash", "op_profit"):
+                if _col not in cols:
+                    c.execute(f"ALTER TABLE fin ADD COLUMN {_col} REAL")
+            _pe_cols = {r[1] for r in c.execute("PRAGMA table_info(stock_pe)")}
+            for _col in ("pb", "ps", "pcf"):
+                if _col not in _pe_cols:
+                    c.execute(f"ALTER TABLE stock_pe ADD COLUMN {_col} REAL")
+            _fp_cols = {r[1] for r in c.execute("PRAGMA table_info(fin_period)")}
+            if "v2" not in _fp_cols:
+                c.execute("ALTER TABLE fin_period ADD COLUMN v2 INTEGER DEFAULT 0")
+            _ed_cols = {r[1] for r in c.execute("PRAGMA table_info(etf_daily)")}
+            for _col in ("pb", "ps", "div_yield", "pe_pct", "pb_pct", "ps_pct"):
+                if _col not in _ed_cols:
+                    c.execute(f"ALTER TABLE etf_daily ADD COLUMN {_col} REAL")
+            if "div_calc" not in _ed_cols:
+                c.execute("ALTER TABLE etf_daily ADD COLUMN div_calc INTEGER DEFAULT 0")
             # 港股：PE 要求市值与净利同币种，股本用于按报告期还原历史市值
             if "currency" not in cols:
                 c.execute("ALTER TABLE fin ADD COLUMN currency TEXT")
             if "shares" not in cols:
                 c.execute("ALTER TABLE fin ADD COLUMN shares REAL")
+            # 港股财报类型与财年截止（v3：按公司财年构造 TTM 需要）
+            if "report_type" not in cols:
+                c.execute("ALTER TABLE fin ADD COLUMN report_type TEXT")
+            if "fiscal_year" not in cols:
+                c.execute("ALTER TABLE fin ADD COLUMN fiscal_year TEXT")
             if "market" not in {r[1] for r in c.execute("PRAGMA table_info(holding)")}:
                 c.execute("ALTER TABLE holding ADD COLUMN market TEXT")
             c.execute("DROP TABLE IF EXISTS _mkt_placeholder")
@@ -210,13 +275,19 @@ class Store:
             except Exception:                            # noqa: BLE001
                 return None
         out: Dict[str, dict] = {}
-        for code, name, pnp, yoy, rev, ryoy, eps, roe, rd, nd, cur, sh in c.execute(
+        for code, name, pnp, yoy, rev, ryoy, eps, roe, rd, nd, cur, sh, \
+                bps, eq, divr, dps, tliab, cash, op, rt, fy in c.execute(
                 "SELECT code,name,parent_np,np_yoy,revenue,rev_yoy,eps,roe,report_date,"
-                "notice_date,currency,shares "
+                "notice_date,currency,shares,"
+                "bps,equity,dividend_rate,dps,total_liab,end_cash,op_profit,"
+                "report_type,fiscal_year "
                 "FROM fin WHERE period=?", (period,)):
             out[code] = {"name": name, "parent_np": pnp, "np_yoy": yoy, "revenue": rev,
                          "rev_yoy": ryoy, "eps": eps, "roe": roe, "report_date": rd,
-                         "notice_date": nd, "currency": cur, "shares": sh}
+                         "notice_date": nd, "currency": cur, "shares": sh,
+                         "bps": bps, "equity": eq, "dividend_rate": divr, "dps": dps,
+                         "total_liab": tliab, "end_cash": cash, "op_profit": op,
+                         "report_type": rt, "fiscal_year": fy}
         return out if len(out) >= max(1, (n or 0) // 2) else None
 
     def fin_has_notice(self, period: str) -> bool:
@@ -235,7 +306,7 @@ class Store:
         return bool(row and row[0] > 0)
 
     def load_fin_subset(self, period: str, codes: List[str]) -> Dict[str, dict]:
-        """只取指定股票在某期的净利润 / 同比 / 披露日——算增速序列时没必要读全市场"""
+        """只取指定股票在某期的净利/营收/同比/披露日/净资产/EPS/ROE 等——算增速与估值序列用"""
         self.init()
         out: Dict[str, dict] = {}
         if not codes:
@@ -244,11 +315,17 @@ class Store:
         for i in range(0, len(codes), B):
             chunk = codes[i:i + B]
             ph = ",".join("?" * len(chunk))
-            for code, pnp, yoy, nd, cur, sh in self._conn().execute(
-                    f"SELECT code,parent_np,np_yoy,notice_date,currency,shares FROM fin "
-                    f"WHERE period=? AND code IN ({ph})", (period, *chunk)):
+            for code, pnp, yoy, nd, cur, sh, rev, bps, eq, divr, dps, tliab, cash, op, eps, roe \
+                    in self._conn().execute(
+                    f"SELECT code,parent_np,np_yoy,notice_date,currency,shares,"
+                    f"revenue,bps,equity,dividend_rate,dps,total_liab,end_cash,op_profit,"
+                    f"eps,roe "
+                    f"FROM fin WHERE period=? AND code IN ({ph})", (period, *chunk)):
                 out[code] = {"parent_np": pnp, "np_yoy": yoy, "notice_date": nd,
-                             "currency": cur, "shares": sh}
+                             "currency": cur, "shares": sh, "revenue": rev,
+                             "bps": bps, "equity": eq, "dividend_rate": divr, "dps": dps,
+                             "total_liab": tliab, "end_cash": cash, "op_profit": op,
+                             "eps": eps, "roe": roe}
         return out
 
     def fin_shares(self, code: str) -> List[Tuple[str, float]]:
@@ -270,13 +347,127 @@ class Store:
             c = self._conn()
             c.execute("DELETE FROM fin WHERE period=?", (period,))
             c.executemany(
-                "INSERT OR REPLACE INTO fin VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO fin (period,code,name,parent_np,np_yoy,revenue,"
+                "rev_yoy,eps,roe,report_date,notice_date,currency,shares,"
+                "bps,equity,dividend_rate,dps,total_liab,end_cash,op_profit,"
+                "report_type,fiscal_year) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [(period, code, v.get("name"), v.get("parent_np"), v.get("np_yoy"),
                   v.get("revenue"), v.get("rev_yoy"), v.get("eps"), v.get("roe"),
                   v.get("report_date"), v.get("notice_date"),
-                  v.get("currency"), v.get("shares")) for code, v in data.items()])
-            c.execute("INSERT OR REPLACE INTO fin_period VALUES (?,?,?,?)",
+                  v.get("currency"), v.get("shares"),
+                  v.get("bps"), v.get("equity"), v.get("dividend_rate"), v.get("dps"),
+                  v.get("total_liab"), v.get("end_cash"), v.get("op_profit"),
+                  v.get("report_type"), v.get("fiscal_year"))
+                 for code, v in data.items()])
+            c.execute("INSERT OR REPLACE INTO fin_period VALUES (?,?,?,?,1)",
                       (period, len(data), 1 if settled else 0, _now()))
+            c.commit()
+
+    def fin_v2(self, period: str) -> bool:
+        """该期财报是否已按扩展列（bps/净资产/股息等）重拉过。
+        港股旧数据靠它触发一次性升级重拉；重拉成功后 save_fin 自动置 v2=1。"""
+        self.init()
+        row = self._conn().execute(
+            "SELECT v2 FROM fin_period WHERE period=?", (period,)).fetchone()
+        return bool(row and row[0])
+
+    def fin_has_report_type(self, period: str) -> bool:
+        """该期是否已存有财报类型/财年截止（v3 字段）。老数据缺这两个字段，
+        需要重拉一次升级——fetch_hk_financials 的缓存命中条件之一。"""
+        self.init()
+        row = self._conn().execute(
+            "SELECT COUNT(*) FROM fin WHERE period=? AND report_type IS NOT NULL",
+            (period,)).fetchone()
+        return bool(row and row[0] > 0)
+
+    def load_fin_rows(self, codes: List[str]) -> Dict[str, List[dict]]:
+        """
+        按公司读取其全部报告期的财报行（升序），供港股按公司财年构造 TTM。
+
+        返回 {code: [{period, parent_np, revenue, op_profit, report_type,
+                     fiscal_year, np_yoy, dps, equity, report_date}, ...]}。
+        与 load_fin_subset（按期取全市场）互补：TTM 构造需要看单家公司的
+        完整报告序列（年报/中报/季报的跨度各不相同）。
+        """
+        self.init()
+        out: Dict[str, List[dict]] = {c: [] for c in codes}
+        if not codes:
+            return out
+        B = 400                                   # SQLite 变量上限保护
+        for i in range(0, len(codes), B):
+            chunk = codes[i:i + B]
+            ph = ",".join("?" * len(chunk))
+            for code, period, pnp, rev, op, rt, fy, yoy, dps, eq, rd in \
+                    self._conn().execute(
+                    f"SELECT code, period, parent_np, revenue, op_profit, report_type, "
+                    f"fiscal_year, np_yoy, dps, equity, report_date FROM fin "
+                    f"WHERE code IN ({ph}) ORDER BY code, period", chunk):
+                out[code].append({
+                    "period": period, "parent_np": pnp, "revenue": rev,
+                    "op_profit": op, "report_type": rt, "fiscal_year": fy,
+                    "np_yoy": yoy, "dps": dps, "equity": eq, "report_date": rd,
+                })
+        return out
+
+    # ------------------------------------------------------------------ #
+    #  10 年期国债收益率（bond_yield）
+    # ------------------------------------------------------------------ #
+    def save_bond_yields(self, rows: List[dict]) -> None:
+        self.init()
+        with _WRITE_LOCK:
+            c = self._conn()
+            c.executemany(
+                "INSERT OR REPLACE INTO bond_yield (d, y10) VALUES (?,?)",
+                [(r["date"], r["y10"]) for r in rows])
+            c.commit()
+
+    def latest_bond_yield(self) -> Tuple[Optional[str], Optional[float]]:
+        self.init()
+        row = self._conn().execute(
+            "SELECT d, y10 FROM bond_yield ORDER BY d DESC LIMIT 1").fetchone()
+        return (row[0], row[1]) if row else (None, None)
+
+    def load_bond_yields(self, start: str, end: str) -> Dict[str, float]:
+        self.init()
+        return {r[0]: r[1] for r in self._conn().execute(
+            "SELECT d, y10 FROM bond_yield WHERE d>=? AND d<=?", (start, end))}
+
+    # ------------------------------------------------------------------ #
+    #  机构一致预期（盈利预测）
+    # ------------------------------------------------------------------ #
+    def load_forecast(self, code: str, max_age: float) -> Optional[dict]:
+        """{years: {year: {mark,np,np_ratio,eps,pe}}, n_org}；过期或无数据返回 None"""
+        self.init()
+        rows = self._conn().execute(
+            "SELECT year, mark, np, np_ratio, eps, pe, n_org, fetched_at "
+            "FROM cons_forecast WHERE code=?", (code,)).fetchall()
+        if not rows:
+            return None
+        try:
+            newest = max(time.mktime(time.strptime(r[7], "%Y-%m-%d %H:%M:%S"))
+                         for r in rows)
+        except Exception:                               # noqa: BLE001
+            return None
+        if time.time() - newest > max_age:
+            return None
+        years = {r[0]: {"mark": r[1], "np": r[2], "np_ratio": r[3],
+                        "eps": r[4], "pe": r[5]} for r in rows}
+        return {"years": years, "n_org": rows[0][6]}
+
+    def save_forecast(self, code: str, years: Dict[int, dict],
+                      n_org: Optional[int]) -> None:
+        self.init()
+        with _WRITE_LOCK:
+            c = self._conn()
+            c.execute("DELETE FROM cons_forecast WHERE code=?", (code,))
+            c.executemany(
+                "INSERT OR REPLACE INTO cons_forecast "
+                "(code, year, mark, np, np_ratio, eps, pe, n_org, fetched_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                [(code, y, v.get("mark"), v.get("np"), v.get("np_ratio"),
+                  v.get("eps"), v.get("pe"), n_org, _now())
+                 for y, v in years.items()])
             c.commit()
 
     # ------------------------------------------------------------------ #
@@ -367,15 +558,26 @@ class Store:
         self.init()
         with _WRITE_LOCK:
             self._conn().executemany(
-                "INSERT OR REPLACE INTO stock_pe VALUES (?,?,?,?,?,?)",
+                # UPSERT：pb/ps/pcf 缺失时保留库里的旧值——
+                # 当日快照/增量重拉可能只带 PE，不能把已入库的 PB 抹成 NULL
+                "INSERT INTO stock_pe (trade_date, code, pe_ttm, pe_lar, mktcap, close, pb, ps, pcf) "
+                "VALUES (?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(trade_date, code) DO UPDATE SET "
+                "pe_ttm=excluded.pe_ttm, pe_lar=excluded.pe_lar, mktcap=excluded.mktcap, "
+                "close=excluded.close, "
+                "pb=COALESCE(excluded.pb, stock_pe.pb), "
+                "ps=COALESCE(excluded.ps, stock_pe.ps), "
+                "pcf=COALESCE(excluded.pcf, stock_pe.pcf)",
                 [(r["date"], r["code"], r.get("pe_ttm"), r.get("pe_lar"),
-                  r.get("mktcap"), r.get("close")) for r in rows])
+                  r.get("mktcap"), r.get("close"),
+                  r.get("pb"), r.get("ps"), r.get("pcf")) for r in rows])
             self._conn().commit()
 
     def load_stock_pe(self, codes: List[str], start: str, end: str) -> Dict[str, Dict[str, tuple]]:
         """
-        返回 {code: {date: (pe_ttm, mktcap, close)}}。
+        返回 {code: {date: (pe_ttm, mktcap, close, pb, ps, pcf)}}。
         用元组而非字典：长区间回填会载入约 200 万格，小字典的分配开销会成为耗时大头。
+        pb/ps/pcf 为 None 表示该行是扩展列启用前入库的旧数据（可用 --init-valuation 重拉补齐）。
         """
         self.init()
         out: Dict[str, Dict[str, tuple]] = {c: {} for c in codes}
@@ -385,13 +587,69 @@ class Store:
         for i in range(0, len(codes), B):
             chunk = codes[i:i + B]
             ph = ",".join("?" * len(chunk))
-            for d, c, pe, mc, cl in self._conn().execute(
-                    f"SELECT trade_date, code, pe_ttm, mktcap, close FROM stock_pe "
+            for d, c, pe, mc, cl, pb, ps, pcf in self._conn().execute(
+                    f"SELECT trade_date, code, pe_ttm, mktcap, close, pb, ps, pcf FROM stock_pe "
                     f"WHERE code IN ({ph}) AND trade_date>=? AND trade_date<=?",
                     (*chunk, start, end)):
                 if c in out:
-                    out[c][d] = (pe, mc, cl)
+                    out[c][d] = (pe, mc, cl, pb, ps, pcf)
         return out
+
+    # ------------------------------------------------------------------ #
+    #  个股历史分红（股息率的数据源，永久保存）
+    # ------------------------------------------------------------------ #
+    def save_stock_div(self, rows: List[dict]) -> None:
+        """写入分红明细 rows=[{code, ex_date, dps, report_date, plan}]"""
+        self.init()
+        with _WRITE_LOCK:
+            self._conn().executemany(
+                "INSERT OR REPLACE INTO stock_div (code, ex_date, dps, report_date, plan) "
+                "VALUES (?,?,?,?,?)",
+                [(r["code"], r["ex_date"], r.get("dps"), r.get("report_date"),
+                  r.get("plan")) for r in rows])
+            self._conn().commit()
+
+    def load_stock_div(self, codes: List[str]) -> Dict[str, List[tuple]]:
+        """返回 {code: [(ex_date, dps), ...]}，按除息日升序（调用方做前缀和 + 二分）"""
+        self.init()
+        out: Dict[str, List[tuple]] = {c: [] for c in codes}
+        if not codes:
+            return out
+        B = 400                                   # SQLite 变量上限保护
+        for i in range(0, len(codes), B):
+            chunk = codes[i:i + B]
+            ph = ",".join("?" * len(chunk))
+            for c, ex, dps in self._conn().execute(
+                    f"SELECT code, ex_date, dps FROM stock_div "
+                    f"WHERE code IN ({ph}) ORDER BY code, ex_date", chunk):
+                if c in out:
+                    out[c].append((ex, dps))
+        return out
+
+    def div_pending(self, codes: List[str]) -> List[str]:
+        """挑出还没拉过分红历史的股票（从未分红的会返回空结果，靠水位避免重拉）"""
+        self.init()
+        done = {r[0] for r in self._conn().execute("SELECT code FROM div_fetch_log")}
+        return [c for c in codes if c not in done]
+
+    def set_div_fetch_log(self, code: str) -> None:
+        self.init()
+        with _WRITE_LOCK:
+            self._conn().execute(
+                "INSERT OR REPLACE INTO div_fetch_log VALUES (?,?)", (code, _now()))
+            self._conn().commit()
+
+    def div_coverage(self) -> dict:
+        """分红拉取进度：done=已拉过股票数，total=估值库快照日清单数（与 pe_coverage 同分母）"""
+        self.init()
+        c = self._conn()
+        snap = self.latest_market_pe_date()
+        total = c.execute("SELECT COUNT(DISTINCT code) FROM stock_pe WHERE trade_date=?",
+                          (snap,)).fetchone()[0] if snap else 0
+        if not total:
+            total = len(self.known_pe_codes())
+        done = c.execute("SELECT COUNT(*) FROM div_fetch_log").fetchone()[0]
+        return {"total": total, "done": done}
 
     def _sync_calendar(self) -> None:
         """
@@ -410,8 +668,12 @@ class Store:
                 "INSERT OR IGNORE INTO trade_calendar(trade_date) "
                 "SELECT DISTINCT trade_date FROM stock_pe WHERE trade_date > ?",
                 (since,))
-            if cur.rowcount:
-                c.commit()
+            # 必须无条件 commit：Python 3.12+ 的 sqlite3 默认 isolation_level=""
+            # 是「隐式事务」，DML 语句执行时自动 BEGIN，不 commit 则写锁不释放。
+            # 曾经用 `if cur.rowcount: commit()`，当 INSERT 全被 IGNORE（无新日期）
+            # 时 rowcount=0 跳过 commit，导致写锁泄漏——并发回填时另一个线程
+            # 等待 30s 后报 `database is locked`。
+            c.commit()
 
     def pe_dates(self, start: str, end: str) -> List[str]:
         """已有 PE 数据的交易日列表（当作交易日历用）"""
@@ -447,6 +709,15 @@ class Store:
         self.init()
         return {r[0] for r in self._conn().execute("SELECT DISTINCT code FROM stock_pe")}
 
+    def fin_codes(self) -> set:
+        """fin 表里出现过的所有代码（港股初始化用它确定要拉 K 线的股票清单）。
+
+        不能用「最新一期财报」过滤：港股公司财年截止日不统一（12 月、3 月、
+        9 月年结都有），财年非 12 月年结的公司财报落在 03-31 / 09-30 期，
+        用最新半年报期过滤会漏掉它们（实测漏 625 只）。"""
+        self.init()
+        return {r[0] for r in self._conn().execute("SELECT DISTINCT code FROM fin")}
+
     def codes_on(self, trade_date: str) -> List[str]:
         """某个交易日有估值数据的全部代码（拿最新快照日即得全市场清单）"""
         self.init()
@@ -481,6 +752,21 @@ class Store:
                     f"AND earliest_requested<=?", (*chunk, start)):
                 ok.add(x)
         return [x for x in codes if x not in ok]
+
+    def pb_pending(self, codes: List[str]) -> List[str]:
+        """估值重初始化用：这些代码里已入库但缺 pb 列数据的（老数据），需要重拉升级"""
+        self.init()
+        c = self._conn()
+        out: List[str] = []
+        B = 500
+        for i in range(0, len(codes), B):
+            chunk = codes[i:i + B]
+            ph = ",".join("?" * len(chunk))
+            for (x,) in c.execute(
+                    f"SELECT code FROM stock_pe WHERE code IN ({ph}) "
+                    f"AND pb IS NULL GROUP BY code", chunk):
+                out.append(x)
+        return out
 
     def pe_coverage(self, start: str) -> dict:
         """
@@ -553,10 +839,16 @@ class Store:
         with _WRITE_LOCK:
             c = self._conn()
             c.executemany(
-                "INSERT OR REPLACE INTO etf_daily VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO etf_daily (d, etf_code, name, pe, g_ttm, g_all, "
+                "peg, coverage, n_valid, n_total, report_date, pb, ps, div_yield, "
+                "pe_pct, pb_pct, ps_pct, div_calc) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [(r.get("date") or default_d, r.get("code"), r.get("name"), r.get("pe"),
                   r.get("g_ttm"), r.get("g_all"), r.get("peg"), r.get("coverage"),
-                  r.get("n_valid"), r.get("n_total"), r.get("report_date"))
+                  r.get("n_valid"), r.get("n_total"), r.get("report_date"),
+                  r.get("pb"), r.get("ps"), r.get("div_yield"),
+                  r.get("pe_pct"), r.get("pb_pct"), r.get("ps_pct"),
+                  r.get("div_calc", 0))
                  for r in rows if r.get("code")])
             c.commit()
 
@@ -576,11 +868,75 @@ class Store:
     def get_history(self, etf_code: str, days: int = 180) -> List[dict]:
         self.init()
         rows = self._conn().execute(
-            "SELECT d, name, pe, g_ttm, g_all, peg, coverage, n_valid, n_total, report_date "
+            "SELECT d, name, pe, g_ttm, g_all, peg, coverage, n_valid, n_total, report_date,"
+            " pb, ps, div_yield, pe_pct, pb_pct, ps_pct, div_calc "
             "FROM etf_daily WHERE etf_code=? ORDER BY d DESC LIMIT ?", (etf_code, days)).fetchall()
         return [{"date": r[0], "name": r[1], "pe": r[2], "g_ttm": r[3], "g_all": r[4],
                  "peg": r[5], "coverage": r[6], "n_valid": r[7], "n_total": r[8],
-                 "report_date": r[9]} for r in rows]
+                 "report_date": r[9], "pb": r[10], "ps": r[11], "div_yield": r[12],
+                 "pe_pct": r[13], "pb_pct": r[14], "ps_pct": r[15],
+                 "div_calc": r[16]} for r in rows]
+
+    def pe_ranking(self, years: Optional[float] = None, top: int = 40,
+                   min_days: int = 60) -> dict:
+        """
+        全市场 ETF 的 PE 历史百分位排行（数据源：etf_daily 每日快照）。
+
+        百分位口径与 analyze_etf 的历史分位一致：窗口内 PE 序列中
+        <= 当前值的比例 × 100，越低 = 当前估值在自身历史上越便宜。
+        当前值取窗口内最新一条快照的 PE——快照由分析（当天）与回填
+        （历史区间）写入，回填过的 ETF 天然带最近交易日的数据。
+
+        years:     窗口年数，None 表示「成立以来」（该 ETF 全部快照历史）。
+        top:       返回前 N 名（百分位升序，附 rank 字段）。
+        min_days:  窗口内有效 PE 样本少于该值的 ETF 不参与——样本太少的
+                   分位没有参考意义（约一个季度的量级）。
+
+        全表一次拉取 + 内存分组：几十万行毫秒~百毫秒级，调用方（server）
+        再做一层 memo 缓存即可。只有分析过 / 回填过历史的 ETF 才有序列，
+        覆盖面随「排行数据准备」批量回填任务扩大。
+        """
+        self.init()
+        cutoff = ""
+        if years:
+            cutoff = (date.today() - timedelta(days=int(years * 365))).isoformat()
+        out: Dict[str, dict] = {}
+        # 只排场内 ETF：etf_daily 里还混着用户分析/回填过的场外基金
+        # （005827 等），它们的单只百分位在分析结果页已有，排行限定场内。
+        for code, name, d, pe, peg, cov, g in self._conn().execute(
+                "SELECT etf_code, name, d, pe, peg, coverage, g_ttm "
+                "FROM etf_daily WHERE d >= ? "
+                "AND etf_code IN (SELECT code FROM etf) "
+                "ORDER BY etf_code, d", (cutoff,)):
+            s = out.setdefault(code, {"name": name, "n_rows": 0, "pes": [],
+                                      "lo": None, "hi": None, "last": None})
+            s["n_rows"] += 1
+            if pe and pe > 0:
+                s["pes"].append(pe)
+                s["lo"] = pe if s["lo"] is None else min(s["lo"], pe)
+                s["hi"] = pe if s["hi"] is None else max(s["hi"], pe)
+            s["last"] = (d, pe, peg, cov, g)            # 按 d 升序，最后一条即最新
+        rows: List[dict] = []
+        for code, s in out.items():
+            last = s["last"]
+            if not last or not last[1] or len(s["pes"]) < min_days:
+                continue
+            cur = last[1]
+            pes = s["pes"]
+            rows.append({
+                "code": code, "name": s["name"], "date": last[0], "pe": cur,
+                "pct": round(sum(1 for x in pes if x <= cur) / len(pes) * 100.0, 1),
+                "days": len(pes), "total_days": s["n_rows"],
+                "coverage": last[3], "peg": last[2], "g_ttm": last[4],
+                "pe_lo": s["lo"], "pe_hi": s["hi"],
+            })
+        rows.sort(key=lambda r: (r["pct"], -(r["coverage"] or 0)))
+        eligible = len(rows)
+        rows = rows[:max(1, top)]
+        for i, r in enumerate(rows, 1):
+            r["rank"] = i
+        return {"rows": rows, "eligible": eligible, "candidates": len(out),
+                "cutoff": cutoff or None, "min_days": min_days}
 
     # ------------------------------------------------------------------ #
     #  状态

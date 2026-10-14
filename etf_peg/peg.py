@@ -23,11 +23,14 @@ from __future__ import annotations
 import math
 import re
 import threading
+from bisect import bisect_right
 from dataclasses import dataclass, asdict, field
 from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from . import datasource as ds
+from . import bond
+from . import forecast
 from . import hk
 from . import store
 
@@ -55,6 +58,17 @@ class StockRow:
     market: Optional[str] = None      # 市场标识：1/0=A股，116=港股，105/106/107=美股
     # 近若干期的增速（与 fin_basis.growth_series 的期别一一对应）
     g_series: Optional[List[Optional[float]]] = None
+    # 近若干期的财务快照（累计口径，与 g_series 同期别一一对应）
+    fin_series: Optional[List[Optional[dict]]] = None
+    # ---- 多指标估值扩展（一期）----
+    pb: Optional[float] = None          # 市净率（A 股东财 PB_MRQ；港股 市值/净资产）
+    ps: Optional[float] = None          # 市销率（市值 / TTM 营收）
+    pcf: Optional[float] = None         # 市现率（A 股东财 PCF_OCF_TTM）
+    equity: Optional[float] = None      # 最新已披露归母净资产（元）
+    rev_ttm: Optional[float] = None     # TTM 营业收入（元）
+    op_ttm: Optional[float] = None      # TTM 营业利润（元，EV/EBIT 用）
+    ev: Optional[float] = None          # 企业价值 = 市值 + 总负债 − 现金（元，近似）
+    div_yield: Optional[float] = None   # 个股股息率 %
     status: str = "ok"                    # ok / no_quote / no_pe / no_growth / no_data
 
 
@@ -92,6 +106,23 @@ class ETFResult:
     warn: str = ""
     stocks: List[dict] = field(default_factory=list)
     updated_at: str = ""
+    # ---- 多指标估值扩展（一期）----
+    pb: Optional[float] = None            # 整体法 PB = Σw / Σ(w/PB_i)
+    pb_coverage: Optional[float] = None   # 参与 PB 计算的权重覆盖 %
+    ps: Optional[float] = None            # 整体法 PS
+    ps_coverage: Optional[float] = None
+    div_yield: Optional[float] = None     # 组合股息率 %（权重加权）
+    ev_ebit: Optional[float] = None       # EV/EBIT（近似口径：EBIT=TTM营业利润，仅港股成分）
+    pcf: Optional[float] = None           # 整体法市现率（A 股 EV 缺材料的现金流补充）
+    pe_equal: Optional[float] = None      # 等权 PE（有效样本算术平均）
+    dist: Optional[dict] = None           # 估值分布：正负样本分开的 PE/增速统计
+    loss_weight: Optional[float] = None   # 亏损股合计权重 %
+    negg_weight: Optional[float] = None   # 负增长股合计权重 %
+    peg_all: Optional[float] = None       # 全样本 PEG = 整体法PE / 全样本增速（水分参照）
+    percentile: Optional[dict] = None     # 历史分位 {pe/pb/ps: {all/y5/y3: 0~100}}
+    forward: Optional[dict] = None        # 前瞻估值 {pe_f, peg_f, cagr, cons_weight, ...}
+    erp: Optional[dict] = None            # 股债性价比 {value, y10, y10_date, pct}
+    feeder_from: Optional[dict] = None    # 联接基金穿透：{code, name} 表示本结果由该联接基金穿透而来
 
 
 # --------------------------------------------------------------------------- #
@@ -138,12 +169,34 @@ def ttm_basis(latest: str) -> List[dict]:
     ]
 
 
+def _acc_ttm(vals: Dict[Tuple[int, int], float],
+             ly: int, lq: int) -> Tuple[Optional[float], Optional[float]]:
+    """
+    累计值 → (本期TTM, 去年同期TTM)。
+    净利 / 营收 / 营业利润等「累计披露」的科目共用同一个公式，
+    缺任一依赖期返回 (None, None)。
+    """
+    cur = vals.get((ly, lq))
+    prev = vals.get((ly - 1, lq))
+    if cur is None or prev is None:
+        return None, None
+    if lq == 4:                           # 年报本身即 TTM
+        return cur, prev
+    ann1 = vals.get((ly - 1, 4))
+    prev2 = vals.get((ly - 2, lq))
+    ann2 = vals.get((ly - 2, 4))
+    if ann1 is None or prev2 is None or ann2 is None:
+        return None, None
+    return cur + ann1 - prev, prev + ann2 - prev2
+
+
 def build_pit_timelines(fin: Dict[str, Dict[str, dict]],
                         codes: List[str]) -> Dict[str, List[tuple]]:
     """
     为每只股票构建 TTM 时间线，实现 PIT（point-in-time）对齐。
 
-    返回 {code: [(生效日, np_ttm, np_ttm_prev, g, 基准期), ...]}（按生效日升序）
+    返回 {code: [(生效日, np_ttm, np_ttm_prev, g, 基准期,
+                  rev_ttm, op_ttm), ...]}（按生效日升序）
 
     「生效日」= 构造这个 TTM 所需全部报告的**最晚真实披露日**。
     例如某公司 7/28 就披露了半年报，那它的 TTM 从 7/28 起就可用，
@@ -151,6 +204,10 @@ def build_pit_timelines(fin: Dict[str, Dict[str, dict]],
 
     这样每家公司各自对齐，不会出现「用 A 公司 7 月就公开的数据，
     却等到 8/31 才计入」这种失真，也不会有前视偏差。
+
+    rev_ttm / op_ttm（TTM 营收、TTM 营业利润）供 PS 与 EV/EBIT 使用：
+    与净利同一组报告、同一公式，保证 PE/PS/EV·EBIT 同源同基准。
+    某些公司财报缺营收/营业利润字段时为 None，不影响净利部分。
     """
     periods = sorted(fin.keys(), reverse=True)
     out: Dict[str, List[tuple]] = {}
@@ -160,7 +217,11 @@ def build_pit_timelines(fin: Dict[str, Dict[str, dict]],
         for p in periods:
             ly, lq = _parse_period(p)
             deps = ds.ttm_required_periods(p)
-            vals, dates, ok = {}, [], True
+            vals: Dict[Tuple[int, int], float] = {}
+            rev_vals: Dict[Tuple[int, int], float] = {}
+            op_vals: Dict[Tuple[int, int], float] = {}
+            dates: List[str] = []
+            ok = True
             for dp in deps:
                 row = (fin.get(dp) or {}).get(c)
                 if not row or row.get("parent_np") is None:
@@ -168,20 +229,22 @@ def build_pit_timelines(fin: Dict[str, Dict[str, dict]],
                     break
                 dy, dq = _parse_period(dp)
                 vals[(dy, dq)] = row["parent_np"]
+                if row.get("revenue") is not None:
+                    rev_vals[(dy, dq)] = row["revenue"]
+                if row.get("op_profit") is not None:
+                    op_vals[(dy, dq)] = row["op_profit"]
                 # 缺披露日时退回法定截止日（保守）
                 dates.append(row.get("notice_date") or str(ds.period_deadline(dp)))
             if not ok:
                 continue
 
-            if lq == 4:                       # 年报本身即 TTM
-                ttm, ttm_prev = vals[(ly, 4)], vals[(ly - 1, 4)]
-            else:
-                ttm = vals[(ly, lq)] + vals[(ly - 1, 4)] - vals[(ly - 1, lq)]
-                ttm_prev = vals[(ly - 1, lq)] + vals[(ly - 2, 4)] - vals[(ly - 2, lq)]
+            ttm, ttm_prev = _acc_ttm(vals, ly, lq)
             if ttm is None or ttm_prev is None:
                 continue
             g = (ttm - ttm_prev) / abs(ttm_prev) * 100.0 if ttm_prev else None
-            tl.append((max(dates), ttm, ttm_prev, g, p))
+            rev_ttm, _ = _acc_ttm(rev_vals, ly, lq)
+            op_ttm, _ = _acc_ttm(op_vals, ly, lq)
+            tl.append((max(dates), ttm, ttm_prev, g, p, rev_ttm, op_ttm))
 
         if tl:
             tl.sort(key=lambda x: x[0])
@@ -200,6 +263,23 @@ def pit_as_of(tl: Optional[List[tuple]], d: str):
         else:
             break
     return best
+
+
+def _ttm_dps(xs: List[str], pre: List[float], d: str) -> float:
+    """
+    近 365 天（(d-365, d]）累计每股现金分红。
+
+    xs = 除息日（升序），pre = 前缀和（pre[i] = xs[:i+1] 的 dps 合计）。
+    二分定位窗口，O(log n)。A 股股息率 = 该值 ÷ 当日股价。
+    """
+    if not xs:
+        return 0.0
+    lo = (date(*map(int, d.split("-"))) - timedelta(days=365)).isoformat()
+    i = bisect_right(xs, lo)                 # 第一个 > lo 的下标
+    j = bisect_right(xs, d)                  # 第一个 > d 的下标
+    if i >= j:
+        return 0.0
+    return pre[j - 1] - (pre[i - 1] if i > 0 else 0.0)
 
 
 def _ttm_for(fin: Dict[str, Dict[str, dict]], code: str,
@@ -257,26 +337,32 @@ def quarterly_growth(codes: List[str], bases: List[str],
                      reverse=True)
     fin: Dict[str, Dict[str, dict]] = {}
     for p in periods:
-        merged = store.load_fin_subset(p, a_codes)
-        if hk_codes and p.endswith(("-06-30", "-12-31")):
-            # 港股只有中报/年报，一季报/三季报期直接跳过，别白打请求。
-            # fetch_hk_financials 自带本地库缓存：已入库的期零网络开销，
-            # 缺失的期自动补拉入库（与 A 股 ensure_series_periods 同一思路）。
-            try:
-                got = hk.fetch_hk_financials(p)
-            except Exception:                               # noqa: BLE001
-                got = None
-            if got:
-                merged.update({c: got[c] for c in hk_codes if c in got})
-        fin[p] = merged
+        fin[p] = store.load_fin_subset(p, a_codes)
+
+    # 港股：按公司财年构造 TTM 时间线（12/3/6/9 月年结都正确），逐基准期
+    # 取「该期披露截止日已生效」的最新条目——比旧逻辑（只在 06-30/12-31
+    # 基准期才有港股数据）更准，且 3 月年结公司不再整段丢失。
+    # 这里只读库不回源：近期财报由 analyze_etf 的拉取循环保证已入库。
+    hk_tl: Dict[str, List[tuple]] = {}
+    if hk_codes:
+        try:
+            hk_tl = hk.build_hk_ttm_timelines(hk_codes)
+        except Exception:                                   # noqa: BLE001
+            hk_tl = {}
 
     series, per = [], {c: [] for c in codes} if with_stocks else None
     for p in bases:
+        p_dl = ds.period_deadline(p).isoformat()   # 该基准期「已知」的截止日
         now = pre = 0.0            # 全样本：含亏损与负增长
         vnow = vpre = 0.0          # 正增长样本：只留增速 > 0 的
         used = vused = 0
         for c in codes:
-            ttm, ttm_prev = _ttm_for(fin, c, p)
+            if c in hk_tl:
+                entry = pit_as_of(hk_tl[c], p_dl)
+                ttm = entry[1] if entry else None
+                ttm_prev = entry[2] if entry else None
+            else:
+                ttm, ttm_prev = _ttm_for(fin, c, p)
             g = ((ttm - ttm_prev) / abs(ttm_prev) * 100.0
                  if (ttm is not None and ttm_prev) else None)
             if with_stocks:
@@ -304,6 +390,36 @@ def quarterly_growth(codes: List[str], bases: List[str],
             "total": len(codes),
         })
     return series, per
+
+
+def stock_fin_series(codes: List[str], bases: List[str]) -> Dict[str, List[Optional[dict]]]:
+    """
+    每只股票在 series_bases 各报告期的财务快照（累计口径，与 g_series 同期别）。
+    返回 {code: [row_or_None, ...]}，与 bases 一一对齐；row 含
+    np / np_yoy / revenue / eps / roe / div_yield 六项。
+    A 股读 A 股库、港股读港股库（字段同名，各自 save_fin 后入库）。
+    """
+    out: Dict[str, List[Optional[dict]]] = {c: [None] * len(bases) for c in codes}
+    a_codes = [c for c in codes if store.market_of(None, c) is store.A]
+    hk_codes = [c for c in codes if store.market_of(None, c) is store.HK]
+    for i, p in enumerate(bases):
+        for lib, cs in ((store.A, a_codes), (store.HK, hk_codes)):
+            if not cs:
+                continue
+            rows = lib.load_fin_subset(p, cs)
+            for c in cs:
+                r = rows.get(c)
+                if not r:
+                    continue
+                out[c][i] = {
+                    "np": r.get("parent_np"),
+                    "np_yoy": r.get("np_yoy"),
+                    "revenue": r.get("revenue"),
+                    "eps": r.get("eps"),
+                    "roe": r.get("roe"),
+                    "div_yield": r.get("dividend_rate"),
+                }
+    return out
 
 
 def build_ttm_series(fin: Dict[str, Dict[str, dict]],
@@ -399,6 +515,34 @@ def _fetch_periods(periods: List[str], on_stage=None, cancel=None) -> Dict[str, 
     return out
 
 
+def _fetch_hk_fin_guarded(period: str, on_progress=None,
+                          timeout_s: float = 600) -> Optional[Dict[str, dict]]:
+    """
+    单期港股财报拉取的护栏。
+
+    正常耗时 1~2 分钟（全市场约 5 页）；但上游偶发会把连接黑洞住——
+    DNS / 代理层挂起时 urlopen 的 socket 超时并不生效，实测能把整个
+    回填任务挂死 8 小时（005889 卡在 2013-06-30 一期）。这里用
+    daemon 线程 + 墙钟超时兜底：超时或异常即放弃该期，该期港股成分的
+    TTM 落空、覆盖率如实下降，绝不让一期数据拖死整个任务。
+    """
+    import threading
+    box: Dict[str, Optional[Dict[str, dict]]] = {}
+
+    def _pull() -> None:
+        try:
+            box["got"] = hk.fetch_hk_financials(period, on_progress=on_progress)
+        except Exception:                               # noqa: BLE001
+            box["got"] = None                           # 单期失败不拖死整个回填
+
+    t = threading.Thread(target=_pull, daemon=True)
+    t.start()
+    t.join(timeout=timeout_s)
+    if t.is_alive():
+        return None
+    return box.get("got")
+
+
 def financial_periods_for(start: Optional[date] = None, depth: int = 4) -> List[str]:
     """
     构建 TTM 时间线所需的全部报告期。depth 是需要的**基准期个数**。
@@ -445,6 +589,28 @@ def analyze_etf(etf_code: str, etf_name: str = "",
     as_of: 计算基准日，默认今天。每只股票只采用该日**之前已披露**的财报。
     series_quarters: 额外计算最近多少个报告期的组合增速（0 表示不算）。
     """
+    # ETF 联接基金：本身不持有股票（持有目标 ETF 份额），直接分析会拿到
+    # 多年前残留的旧股票持仓（如 2021 年），PEG 完全失真。这里自动穿透到
+    # 目标 ETF 重新分析；匹配不到目标 ETF 时直接阻断，避免用失真数据出结果。
+    feeder = ds.resolve_feeder_target(etf_code, etf_name)
+    if feeder:
+        tgt = feeder.get("target")
+        if tgt and tgt["code"] != etf_code:
+            res = analyze_etf(tgt["code"], tgt["name"], growth_mode,
+                              quotes, fin, holdings, record, as_of, series_quarters)
+            res.feeder_from = {"code": etf_code, "name": etf_name or etf_code}
+            return res
+        res = ETFResult(code=etf_code, name=etf_name or etf_code,
+                        report_date=None, fin_period=None,
+                        updated_at=ds._now())
+        res.warn = ("该基金是 ETF 联接基金，不直接持有股票（持有目标 ETF 份额），"
+                    "无法计算有意义的 PE/PEG。"
+                    + (f"请分析其跟踪标的对应的场内 ETF（跟踪：{feeder['tracking']}）。"
+                       if feeder.get("tracking")
+                       else "请在搜索框直接搜索对应的场内 ETF。"))
+        res.feeder_from = {"code": etf_code, "name": etf_name or etf_code}
+        return res
+
     if holdings is None:
         holdings = ds.fetch_etf_holdings(etf_code)
     if quotes is None:
@@ -474,8 +640,9 @@ def analyze_etf(etf_code: str, etf_name: str = "",
         res.warn = "未获取到该 ETF 的持仓明细（可能是新成立基金或债券/商品类 ETF）"
         return res
 
-    # 近 N 个报告期各自的组合增速 + 每只股票的逐期增速
+    # 近 N 个报告期各自的组合增速 + 每只股票的逐期增速 / 财务快照
     per_stock_series: Optional[Dict[str, List[Optional[float]]]] = None
+    fin_series_map: Optional[Dict[str, List[Optional[dict]]]] = None
     if series_quarters > 0:
         try:
             ensure_series_periods(series_quarters)
@@ -484,8 +651,9 @@ def analyze_etf(etf_code: str, etf_name: str = "",
                 [s["code"] for s in stocks], bases, with_stocks=True)
             res.growth_series = sers
             basis["series_bases"] = bases
+            fin_series_map = stock_fin_series([s["code"] for s in stocks], bases)
         except Exception:                               # noqa: BLE001
-            res.growth_series, per_stock_series = None, None
+            res.growth_series, per_stock_series, fin_series_map = None, None, None
 
     # 场外基金：统计股票仓位与非 A 股持仓。
     # 主动基金常持有现金/债券，重仓港股的基金 A 股部分可能只有一半，
@@ -521,44 +689,80 @@ def analyze_etf(etf_code: str, etf_name: str = "",
     hk_close: Dict[str, Optional[float]] = {}
     if hk_codes:
         try:
-            for p in hk.hk_fin_periods(depth=4):
+            # depth=6（6 个季度基准期）：四季期口径下足够覆盖最新一期 +
+            # 其 TTM 依赖 + prev 依赖；首批调用会触发 v3 重拉（补财报
+            # 类型字段），之后永久缓存。纯 A 股 ETF 零开销。
+            for p in hk.hk_fin_periods(depth=6):
                 got = hk.fetch_hk_financials(p)
                 if got:
                     fin.setdefault(p, {}).update(got)   # 5 位与 6 位代码不会撞
         except Exception:                               # noqa: BLE001
             pass                                        # 港股不可用时退化为「只算 A 股」
-        try:
-            hk_d = hk.ensure_hk_market_snapshot()
-            if hk_d:
-                m = store.HK.load_stock_pe(hk_codes, hk_d, hk_d)
-                # cell = (pe_ttm, mktcap, close)。close 一并取出：
-                # 港股不在 A 股实时行情里，不补的话股价一栏是空的
-                hk_mc = {c: ((m.get(c) or {}).get(hk_d) or (None,) * 3)[1] for c in m}
-                hk_close = {c: ((m.get(c) or {}).get(hk_d) or (None,) * 3)[2]
-                            for c in m}
-        except Exception:                               # noqa: BLE001
-            hk_mc = {}
-            hk_close = {}
+    try:
+        hk_d = hk.ensure_hk_market_snapshot()
+        if hk_d:
+            m = store.HK.load_stock_pe(hk_codes, hk_d, hk_d)
+            # cell = (pe_ttm, mktcap, close, pb, ps, pcf)。close 一并取出：
+            # 港股不在 A 股实时行情里，不补的话股价一栏是空的
+            hk_mc = {c: ((m.get(c) or {}).get(hk_d) or (None,) * 6)[1] for c in m}
+            hk_close = {c: ((m.get(c) or {}).get(hk_d) or (None,) * 6)[2]
+                        for c in m}
+    except Exception:                               # noqa: BLE001
+        hk_mc = {}
+        hk_close = {}
 
     # PE 统一用 PE-TTM（东财估值库）：历史序列只有这个口径，
     # 实时行情的「市盈率(动态)」是年化值、无历史，两边混用会导致曲线断裂。
+    # PB/PS/PCF 与 PE 同一行数据（RPT_VALUEANALYSIS_DET），一并取出零额外开销。
     pe_date = None
-    pe_src: Dict[str, Optional[float]] = {}
+    val_src: Dict[str, dict] = {}
     try:
         pe_date = ds.ensure_market_pe()
         if pe_date:
             m = store.load_stock_pe([s["code"] for s in stocks
                                      if s["code"] not in set(hk_codes)], pe_date, pe_date)
-            pe_src = {c: (m.get(c) or {}).get(pe_date, (None,) * 3)[0] for c in m}
-    except Exception:                                   # noqa: BLE001
+            for c, days in m.items():
+                cell = days.get(pe_date) or (None,) * 6
+                val_src[c] = {"pe": cell[0], "mktcap": cell[1],
+                              "pb": cell[3], "ps": cell[4], "pcf": cell[5]}
+    except Exception:                               # noqa: BLE001
         pe_date = None
     res.pe_date = pe_date
 
     # 按每家公司真实披露日逐只对齐（PIT）：
     # 只用 as_of 之前已公开的数据，早披露的公司提前计入，晚披露的延后计入。
     as_of_date = as_of or date.today().isoformat()
-    timelines = build_pit_timelines(fin, [s["code"] for s in stocks])
+    # A 股走日历季度公式；港股统一走按公司财年的构造器（12/3/6/9 月年结
+    # 都正确），元组结构一致，pit_as_of 与下游零改动。混用 A 股公式会把
+    # 非 12 月年结公司（财报在 03-31/09-30 期）静默漏掉。
+    timelines = build_pit_timelines(
+        fin, [s["code"] for s in stocks
+              if store.market_of(s.get("market"), s["code"]) is store.A])
+    if hk_codes:
+        try:
+            timelines.update(hk.build_hk_ttm_timelines(hk_codes))
+        except Exception:                               # noqa: BLE001
+            pass                                        # 构造失败退化为「该股无 TTM」
     used_periods: Dict[str, int] = {}
+
+    # 股息率：A 股用分红明细（近 12 个月滚动窗口），港股用财报 dps。
+    # 分红未初始化时 A 股部分为 None（不误报）；港股逻辑维持现状。
+    a_div: Dict[str, tuple] = {}
+    try:
+        div_map = store.load_stock_div([s["code"] for s in stocks
+                                        if ds.is_a_share(s.get("market"), s["code"])])
+        for c, evs in div_map.items():
+            if evs:
+                xs: List[str] = []
+                pre: List[float] = []
+                acc = 0.0
+                for ex, dps in evs:
+                    acc += dps
+                    xs.append(ex)
+                    pre.append(acc)
+                a_div[c] = (xs, pre)
+    except Exception:                                   # noqa: BLE001
+        a_div = {}
 
     rows: List[StockRow] = []
     for s in stocks:
@@ -566,13 +770,14 @@ def analyze_etf(etf_code: str, etf_name: str = "",
         q = quotes.get(code) or {}
         hit = pit_as_of(timelines.get(code), as_of_date)
         if hit:
-            _, np_ttm, np_ttm_prev, g_ttm, base_p = hit
+            _, np_ttm, np_ttm_prev, g_ttm, base_p, rev_ttm, op_ttm = hit
             fin_row = (fin.get(base_p) or {}).get(code) or {}
             g_latest = fin_row.get("np_yoy")
             fin_date = fin_row.get("notice_date")
             used_periods[base_p] = used_periods.get(base_p, 0) + 1
         else:
             np_ttm = np_ttm_prev = g_ttm = base_p = None
+            rev_ttm = op_ttm = None
             g_latest = fin_date = None
 
         # PE = 实时总市值 ÷ 该股「最新已披露」的 TTM 归母净利。
@@ -580,8 +785,47 @@ def analyze_etf(etf_code: str, etf_name: str = "",
         # 港股的 mc 来自港股库的当日快照，其余逻辑与 A 股完全相同。
         mc = q.get("mktcap") or hk_mc.get(code)
         pe = (mc / np_ttm) if (mc and np_ttm and np_ttm > 0) else None
+        vs = val_src.get(code) or {}
         if pe is None or pe <= 0:                 # 兜底：东财估值库 → 行情动态 PE
-            pe = pe_src.get(code) or q.get("pe_ttm")
+            pe = vs.get("pe") or q.get("pe_ttm")
+
+        # ---- 多指标（PB / PS / 净资产 / 股息 / EV）----
+        # PB：A 股直接用东财 PB_MRQ（与 PE 同源）；净资产反推 = 市值 / PB。
+        # 港股净资产用最新已披露的 TOTAL_PARENT_EQUITY，PB = 当日市值 ÷ 净资产。
+        equity = fin_row.get("equity") if base_p else None
+        pb = vs.get("pb")
+        if pb is None and equity and mc and equity > 0 and mc > 0:
+            pb = mc / equity
+        if pb is not None and (equity is None) and pb and mc and pb > 0:
+            equity = mc / pb
+        # PS：市值 ÷ TTM 营收（与 PE 同一套报告同源构造）
+        ps = (mc / rev_ttm) if (mc and rev_ttm and rev_ttm > 0) else None
+        if ps is None:
+            ps = vs.get("ps")
+        # 股息率：A 股 = 近 12 个月累计每股分红 ÷ 现价（与回填同口径）；
+        # 港股 = DPS(近一年每股分红)×股本 ÷ 市值，退化用报告期股息率。
+        div_y = None
+        price = q.get("price") or hk_close.get(code)
+        if code in a_div and price and price > 0:
+            xs, pre = a_div[code]
+            ttm = _ttm_dps(xs, pre, as_of_date)
+            if ttm and ttm > 0:
+                div_y = ttm / price * 100.0
+        if div_y is None:
+            shares = fin_row.get("shares") if base_p else None
+            dps = fin_row.get("dps") if base_p else None
+            if dps and shares and mc and mc > 0:
+                div_y = dps * shares / mc * 100.0
+            elif fin_row.get("dividend_rate") is not None:
+                div_y = fin_row.get("dividend_rate")
+        # EV/EBIT（近似口径）：EV = 市值 + 总负债 − 现金，EBIT = TTM 营业利润。
+        # 负债/现金只有港股财报提供，A 股成分 EV 为 None。
+        ev = None
+        tliab = fin_row.get("total_liab") if base_p else None
+        cash = fin_row.get("end_cash") if base_p else None
+        if mc and tliab is not None and cash is not None:
+            ev = mc + tliab - cash
+        pcf = vs.get("pcf")
 
         row = StockRow(
             code=code,
@@ -595,10 +839,22 @@ def analyze_etf(etf_code: str, etf_name: str = "",
             g_ttm=g_ttm,
             g_latest=g_latest,
             fin_period=base_p,
-            fin_label=report_label(base_p) if base_p else None,
+            # 港股财报自带类型（如「2025年年报」），按公司财年显示；
+            # A 股 fin 行没有该字段，退回日历标签
+            fin_label=((fin_row.get("report_type") if base_p else None)
+                       or (report_label(base_p) if base_p else None)),
             fin_date=fin_date,
             market=s.get("market"),
             g_series=(per_stock_series or {}).get(code),
+            fin_series=(fin_series_map or {}).get(code),
+            pb=pb,
+            ps=ps,
+            pcf=pcf,
+            equity=equity,
+            rev_ttm=rev_ttm,
+            op_ttm=op_ttm,
+            ev=ev,
+            div_yield=div_y,
         )
 
         g = row.g_ttm if growth_mode == "ttm" else row.g_latest
@@ -709,6 +965,71 @@ def analyze_etf(etf_code: str, etf_name: str = "",
     if wsum > 0:
         res.peg_weighted_avg = sum((r.weight or 0) * r.peg for r in valid) / wsum
 
+    # ---- 全样本 PEG：衡量当前 PEG 的「水分」 -----------------------------
+    # 有效 PEG 只含正增长样本；全样本 PEG 用同一 PE ÷ 全样本增速（含亏损/负增长）。
+    # 两者差距越大，说明当前 PEG 越依赖「剔除负增长」这个隐含假设。
+    if res.pe and res.g_all is not None and res.g_all > 0:
+        res.peg_all = res.pe / res.g_all
+
+    # ---- 多指标估值：PB / PS / 股息率 / EV·EBIT / 等权 PE ----------------
+    # 口径与整体法 PE 完全一致：Σw / Σ(w / 指标_i)，只统计有该指标数据的样本，
+    # 并分别给出各指标的权重覆盖率（分母缺样本时值会失真，必须可查）。
+    def _harm(items: List[tuple]) -> Tuple[Optional[float], float]:
+        """items=[(weight, value>0), ...] → (Σw/Σ(w/v), 参与权重合计)"""
+        num = den = 0.0
+        for w, v in items:
+            if w and w > 0 and v and v > 0:
+                num += w
+                den += w / v
+        return (num / den, num) if den > 0 else (None, num)
+
+    pb_items = [(r.weight, r.pb) for r in rows if r.pb and r.pb > 0]
+    res.pb, pb_w = _harm(pb_items)
+    res.pb_coverage = (pb_w / all_w * 100.0) if all_w else None
+    ps_items = [(r.weight, r.ps) for r in rows if r.ps and r.ps > 0]
+    res.ps, ps_w = _harm(ps_items)
+    res.ps_coverage = (ps_w / all_w * 100.0) if all_w else None
+    pcf_items = [(r.weight, r.pcf) for r in rows if r.pcf and r.pcf > 0]
+    res.pcf, _ = _harm(pcf_items)
+    # 股息率是比率，用权重加权平均（不是调和平均）
+    dv_num = dv_den = 0.0
+    for r in rows:
+        if r.div_yield is not None and r.weight and r.weight > 0:
+            dv_num += r.weight * r.div_yield
+            dv_den += r.weight
+    res.div_yield = (dv_num / dv_den) if dv_den > 0 else None
+    # EV/EBIT：只统计有 EV 材料的样本（目前仅港股），口径近似，界面明示
+    ev_items = [(r.weight, r.ev / r.op_ttm) for r in rows
+                if r.ev is not None and r.ev > 0 and r.op_ttm and r.op_ttm > 0]
+    res.ev_ebit, ev_w = _harm(ev_items)
+    # 等权 PE：有效样本算术平均（对照整体法，看大权重的拉偏程度）
+    pe_vals = [r.pe_ttm for r in valid if r.pe_ttm and r.pe_ttm > 0]
+    res.pe_equal = (sum(pe_vals) / len(pe_vals)) if pe_vals else None
+
+    # ---- 估值分布：盈利/亏损、正增长/负增长样本分开统计 -------------------
+    g_of = (lambda r: r.g_ttm if growth_mode == "ttm" else r.g_latest)
+    profit = [r for r in rows if r.np_ttm is not None and r.np_ttm > 0]
+    loss = [r for r in rows if r.np_ttm is not None and r.np_ttm <= 0]
+    pos_g = [r for r in rows if g_of(r) is not None and g_of(r) > 0]
+    neg_g = [r for r in rows if g_of(r) is not None and g_of(r) <= 0]
+    w_of = lambda rs: sum(r.weight or 0 for r in rs)                # noqa: E731
+    pe_of = lambda rs: [r.pe_ttm for r in rs if r.pe_ttm and r.pe_ttm > 0]   # noqa: E731
+    g_of_vals = lambda rs: [g_of(r) for r in rs if g_of(r) is not None]      # noqa: E731
+    harm_of = lambda rs: _harm([(r.weight, r.pe_ttm) for r in rs
+                                if r.pe_ttm and r.pe_ttm > 0])[0]            # noqa: E731
+    res.dist = {
+        "profit": {"n": len(profit), "weight": round(w_of(profit), 2),
+                   "pe_med": _median(pe_of(profit)) if pe_of(profit) else None,
+                   "pe_harm": harm_of(profit)},
+        "loss": {"n": len(loss), "weight": round(w_of(loss), 2)},
+        "growth_pos": {"n": len(pos_g), "weight": round(w_of(pos_g), 2),
+                       "g_med": _median(g_of_vals(pos_g)) if g_of_vals(pos_g) else None},
+        "growth_neg": {"n": len(neg_g), "weight": round(w_of(neg_g), 2),
+                       "g_med": _median(g_of_vals(neg_g)) if g_of_vals(neg_g) else None},
+    }
+    res.loss_weight = w_of(loss) or 0.0
+    res.negg_weight = w_of(neg_g) or 0.0
+
     # ---- 警示 ------------------------------------------------------------
     warns = []
     if not res.holdings_full:
@@ -725,6 +1046,10 @@ def analyze_etf(etf_code: str, etf_name: str = "",
                      f"有效样本增速存在正向选择性偏差，PEG 可能偏乐观")
     if res.report_date:
         warns.append(f"持仓为 {res.report_date} 定期报告数据，非实时")
+    if res.forward and res.forward.get("cons_weight") is not None \
+            and res.forward["cons_weight"] < 70:
+        warns.append(f"一致预期仅覆盖 {res.forward['cons_weight']:.0f}% 权重"
+                     f"（港股/小票无预测数据），前瞻指标代表性不足")
 
     # ---- 场外/主动基金特有的警示 ------------------------------------------
     if res.equity_ratio is not None and res.equity_ratio < 70:
@@ -747,6 +1072,74 @@ def analyze_etf(etf_code: str, etf_name: str = "",
         warns.append(f"主动管理型基金（{res.fund_type}）季度间可能大幅调仓，"
                      f"用 {res.report_date} 的持仓做「实时」PEG，滞后风险高于指数基金")
     res.warn = "；".join(warns)
+
+    # ---- 历史分位：当前值在自身每日快照序列中的位置 ----------------------
+    # 数据来自 etf_daily：pe 一期前就有，pb/ps 随 --init-valuation + 回填积累。
+    # 单 ETF 至多 2100 行，分位查询时现算（毫秒级），不做预聚合表。
+    try:
+        hist = list(reversed(store.get_history(etf_code, 99999)))
+        if len(hist) >= 60:
+            def _pct(vals: List[Optional[float]], cur: Optional[float]) -> Optional[float]:
+                if cur is None:
+                    return None
+                have = [x for x in vals if x is not None]
+                # 样本过少的分位没有参考意义（如 PS 序列刚积累一两天），
+                # 宁可显示 — 也不要给一个误导值
+                if len(have) < 30:
+                    return None
+                return sum(1 for x in have if x <= cur) / len(have) * 100.0
+
+            def _win(days: Optional[int]) -> List[dict]:
+                if not days:
+                    return hist
+                cutoff = (date.today() - timedelta(days=days)).isoformat()
+                return [r for r in hist if r["date"] >= cutoff]
+
+            pl: Dict[str, dict] = {}
+            for key, cur in (("pe", res.pe), ("pb", res.pb), ("ps", res.ps)):
+                if cur is None:
+                    continue
+                wins = {"all": _win(None), "y5": _win(365 * 5), "y3": _win(365 * 3)}
+                hit_pct = {w: _pct([r.get(key) for r in rs], cur)
+                           for w, rs in wins.items()}
+                if any(v is not None for v in hit_pct.values()):
+                    pl[key] = hit_pct
+            res.percentile = pl or None
+    except Exception:                                   # noqa: BLE001
+        res.percentile = None
+
+    # ---- 前瞻 PE / 前瞻 PEG（机构一致预期，仅 A 股成分）------------------
+    # 前瞻 PEG = 当前市值口径的组合前瞻 PE ÷ 2026E→2028E 一致预期净利 CAGR。
+    # 港股无免费一致预期数据源（实测），只覆盖 A 股成分，cons_weight 如实反映覆盖比例。
+    try:
+        a_rows = [r for r in rows
+                  if ds.is_a_share(r.market, r.code) and r.weight and r.weight > 0]
+        res.forward = forecast.forward_valuation(
+            a_rows,
+            a_weight_total=sum(r.weight or 0 for r in a_rows),
+            all_weight=all_w)
+    except Exception:                                   # noqa: BLE001
+        res.forward = None
+
+    # ---- 股债性价比（ERP）= 盈利收益率 1/PE − 10Y 国债收益率 --------------
+    # 分位基于「本 ETF 的逐日 PE × 当日 10Y」构成的历史 ERP 序列；
+    # 10Y 数据增量拉取（滞后 2 天内零网络）。
+    try:
+        bond.ensure_y10()
+        y10_d, y10 = bond.latest_y10()
+        if res.pe and res.pe > 0 and y10:
+            erp_now = 100.0 / res.pe - y10
+            y10_map = bond.load_y10_series("1900-01-01", date.today().isoformat())
+            erps = [100.0 / r["pe"] - y10_map[r["date"]]
+                    for r in reversed(store.get_history(etf_code, 99999))
+                    if r.get("pe") and r["pe"] > 0 and r["date"] in y10_map]
+            res.erp = {
+                "value": erp_now, "y10": y10, "y10_date": y10_d,
+                "pct": (sum(1 for x in erps if x <= erp_now) / len(erps) * 100.0)
+                if len(erps) >= 60 else None,
+            }
+    except Exception:                                   # noqa: BLE001
+        res.erp = None
 
     rows.sort(key=lambda r: (-(r.weight or 0)))
     res.stocks = [asdict(r) for r in rows]
@@ -784,13 +1177,16 @@ def aggregate_history(rows: List[dict], by: str = "month") -> List[dict]:
             cur = {"key": k, "date": r["date"], "pe": r.get("pe"),
                    "g_ttm": r.get("g_ttm"), "g_all": r.get("g_all"),
                    "peg": r.get("peg"), "coverage": r.get("coverage"),
+                   "pb": r.get("pb"), "ps": r.get("ps"),
+                   "div_yield": r.get("div_yield"),
                    "n_valid": r.get("n_valid"), "n_total": r.get("n_total"),
                    "report_date": r.get("report_date"), "days": 1,
                    "pe_lo": r.get("pe"), "pe_hi": r.get("pe"),
                    "peg_lo": r.get("peg"), "peg_hi": r.get("peg")}
         else:
             cur["date"] = r["date"]
-            for f in ("pe", "g_ttm", "g_all", "peg", "coverage"):
+            for f in ("pe", "g_ttm", "g_all", "peg", "coverage", "pb", "ps",
+                      "div_yield"):
                 if r.get(f) is not None:
                     cur[f] = r[f]
             cur["n_valid"], cur["n_total"] = r.get("n_valid"), r.get("n_total")
@@ -927,8 +1323,17 @@ def backfill_etf(etf_code: str, days: int = 180, on_stage=None,
     # 代码位数天然不冲突（A 股 6 位、港股 5 位），合并后可直接当一份数据用。
     hk_codes = [c for c in codes if store.market_of(None, c) is store.HK]
     a_codes = [c for c in codes if c not in set(hk_codes)]
-    # 港股只有中报/年报，报告期集合与 A 股不同，两份都要覆盖到
-    hk_periods = set(hk.hk_fin_periods(depth=max(6, n_quarters))) if hk_codes else set()
+    # 港股只有中报/年报，报告期集合与 A 股不同，两份都要覆盖到。
+    # 基准期下限与 A 股 financial_periods_for 同一裁剪逻辑：早于
+    # 「区间起点前一个季度」的基准期，其 TTM 生效日必然早于 first_dl，
+    # 逐日循环里 _latest_known 会把那些日期整段跳过，财报拉了也用不上。
+    # 不裁剪的话（005889 实测）会去逐期拉 2012~2018 年的全市场港股财报，
+    # 每期 1~2 分钟且无进度反馈，进度条在 15% 停半小时起步，像卡死。
+    hk_periods: set = set()
+    if hk_codes:
+        hk_periods = set(hk.hk_fin_periods(
+            depth=max(6, n_quarters),
+            min_deadline=start - timedelta(days=110)))
     all_periods = sorted(set(needed) | hk_periods, reverse=True)
 
     # ---- 2b. 财报：已入库的期只读成分股子集，缺失的期才回源全市场 --------
@@ -944,11 +1349,23 @@ def backfill_etf(etf_code: str, days: int = 180, on_stage=None,
 
         got = _fetch_periods(missing, on_stage=_fin_stage, cancel=cancel)
         fin.update(got)
+    hk_fin_list = [p for p in all_periods if p in hk_periods]
+    hk_fin_done = 0
     for p in all_periods:
+        if cancel and cancel():
+            return 0
         if p not in fin:
             fin[p] = store.load_fin_subset(p, a_codes)
         if p in hk_periods:
-            got = hk.fetch_hk_financials(p)
+            hk_fin_done += 1
+            base = 15 + 15.0 * (hk_fin_done - 1) / max(1, len(hk_fin_list))
+            # 已入库的期 fetch_hk_financials 零网络秒回；缺失的期要拉全市场
+            # 约 5 页、实测 1~2 分钟。必须逐页上报进度，否则进度条会在
+            # 15% 停上半小时起步（005889 实测），用户只能以为卡死了。
+            def _hk_page(pg: int, total: int, _b=base, _p=p) -> None:
+                tell(_b, f"载入财报…（港股 {_p} 第 {pg}/{total} 页）")
+
+            got = _fetch_hk_fin_guarded(p, on_progress=_hk_page)
             if got:
                 tgt = fin.setdefault(p, {})
                 for c in hk_codes:                  # 只取持仓里的，别把全市场塞进来
@@ -966,12 +1383,17 @@ def backfill_etf(etf_code: str, days: int = 180, on_stage=None,
     # （510300 实测约 790 只 × 1.36 s ≈ 18 分钟的纯浪费）。
     # 若计算方法变更，用 force=True 或 --clear-history 强制重算。
     have: set = set()
+    div_have: set = set()
     if not force:
-        have = {r["date"] for r in store.get_history(etf_code, 6000)}
+        hist = store.get_history(etf_code, 6000)
+        have = {r["date"] for r in hist}
+        div_have = {r["date"] for r in hist if r.get("div_calc")}
     dates = store.pe_dates(start_s, today_s)
     todo_dates = dates
     if dates and not force:
-        todo_dates = [d for d in dates if d not in have]
+        # 缺 PE 的日期，或「有 PE 但还没补过股息率」的日期，都要算。
+        # 后者是升级老库的一次性补算：算完后 div_calc=1，下次秒回。
+        todo_dates = [d for d in dates if d not in have or d not in div_have]
         if not todo_dates:
             return len(dates)
 
@@ -994,17 +1416,28 @@ def backfill_etf(etf_code: str, days: int = 180, on_stage=None,
         tell(70, "A 股历史 PE 已全部入库")
 
     todo_hk = store.HK.pe_pending(hk_codes, start_s) if hk_codes else []
-    if todo_hk:
+    gap_hk: List[str] = []
+    if hk_codes:
+        try:
+            # 内部日历空洞（K 线拉取时刻 → 下次快照之间的缺口）：逐只补拉
+            # 覆盖回填区间，否则那些天该股被静默跳过、覆盖率骤降
+            gap_hk = [c for c in hk.detect_kline_gaps(hk_codes, start_s, today_s)
+                      if c not in set(todo_hk)]
+        except Exception:                               # noqa: BLE001
+            gap_hk = []
+    if todo_hk or gap_hk:
         try:
             shares_now = {c["code"]: c.get("shares")
                           for c in hk.fetch_hk_list() if c.get("shares")}
         except Exception:                               # noqa: BLE001
             shares_now = {}
-        n_hk = len(todo_hk)
-        for i, c in enumerate(todo_hk, 1):
+        pulls = [("补拉" if c in set(gap_hk) else "拉取", c)
+                 for c in todo_hk + gap_hk]
+        n_hk = len(pulls)
+        for i, (verb, c) in enumerate(pulls, 1):
             if cancel and cancel():
                 return 0
-            tell(70 + 15.0 * (i - 1) / n_hk, f"拉取港股历史行情 {i}/{n_hk}…")
+            tell(70 + 15.0 * (i - 1) / n_hk, f"{verb}港股历史行情 {c} {i}/{n_hk}…")
             try:
                 closes = hk.fetch_hk_kline(c, start_s)
                 if closes:
@@ -1024,7 +1457,8 @@ def backfill_etf(etf_code: str, days: int = 180, on_stage=None,
         dates = hk_dates if not a_codes else sorted(set(dates) | set(hk_dates))
     if not dates:
         raise RuntimeError("未获取到任何历史 PE 数据")
-    todo_dates = dates if force else [d for d in dates if d not in have]
+    todo_dates = dates if force else [d for d in dates
+                                      if d not in have or d not in div_have]
     if not todo_dates:
         return len(dates)
 
@@ -1033,9 +1467,37 @@ def backfill_etf(etf_code: str, days: int = 180, on_stage=None,
     if hk_codes:
         pe_map.update(store.HK.load_stock_pe(hk_codes, start_s, today_s))
 
+    # 股息率数据：A 股分红明细 → (除息日升序, 前缀和)，供逐日滚动窗口；
+    # 港股用财报 dps（近一年每股分红，DPS_HKD），在逐日循环里按 PIT 基准期取。
+    # 分红未初始化时 div_series 为空，A 股股息率列为 NULL，不误报。
+    div_series: Dict[str, tuple] = {}
+    if a_codes:
+        div_map = store.load_stock_div(a_codes)
+        for c, evs in div_map.items():
+            if evs:
+                xs: List[str] = []
+                pre: List[float] = []
+                acc = 0.0
+                for ex, dps in evs:
+                    acc += dps
+                    xs.append(ex)
+                    pre.append(acc)
+                div_series[c] = (xs, pre)
+    # 分红数据可用性：A 股分红已初始化（div_series 非空）或纯港股（无 A 股成分）。
+    # 分红未初始化时 div_calc 保持 0 —— 不能因为「暂时算不出」就标记完成，
+    # 否则分红数据补全后增量判定会误以为已算过、永远不再重算（512480 实测踩坑）。
+    div_ready = bool(div_series) or not a_codes
+
     # ---- 5. 构建每只股票的 TTM 时间线（按真实披露日生效） ------------------
     tell(88, "按各公司披露日构建 TTM 时间线…")
-    timelines = build_pit_timelines(fin, codes)
+    # A 股走日历季度公式；港股按公司财年构造（12/3/6/9 月年结都正确，
+    # 3 月年结公司的财报在 03-31/09-30 期，A 股公式会静默漏掉它们）
+    timelines = build_pit_timelines(fin, a_codes)
+    if hk_codes:
+        try:
+            timelines.update(hk.build_hk_ttm_timelines(hk_codes))
+        except Exception:                               # noqa: BLE001
+            pass                                        # 构造失败退化为「该股无 TTM」
 
     # ---- 6. 逐交易日计算 --------------------------------------------------
     etf_name = etf_code
@@ -1066,22 +1528,40 @@ def backfill_etf(etf_code: str, days: int = 180, on_stage=None,
         # 财报：逐只按真实披露日对齐（PIT），谁先披露谁先进组合
         # 样本 —— 只保留 PE>0 且增速>0 的成分股
         # PE   —— Σw / Σ(w / PE_i)，w 为基金披露的持仓权重
+        # PB/PS 与 PE 同口径：只统计有数据的样本，覆盖率随列数如实反映
         w_sum = den = np_now = np_pre = 0.0
+        pb_num = pb_den = ps_num = ps_den = 0.0
+        div_num = div_den = 0.0
         n_valid = 0
         for c, w in wmap.items():
             if not w or w <= 0:
                 continue
+            cell = (pe_map.get(c) or {}).get(d)
+            # ---- 股息率：在 PE/增速过滤之前累积。亏损股照样分红，
+            # 不能因被 PE 剔除而连带剔除其股息，否则组合股息率被高估。
+            # A 股 = 近 12 个月累计每股分红 ÷ 当日收盘价（分红明细滚动窗口）
+            if cell and cell[2] and cell[2] > 0 and c in div_series:
+                xs, pre = div_series[c]
+                ttm = _ttm_dps(xs, pre, d)
+                if ttm and ttm > 0:
+                    div_num += w * ttm / cell[2] * 100.0
+                    div_den += w
             hit = pit_as_of(timelines.get(c), d)
             if not hit:
                 continue
-            _, np_ttm, np_ttm_prev, g, _base = hit
+            _, np_ttm, np_ttm_prev, g, _base, _rev, _op = hit
+            # 港股股息率：财报近一年每股分红（DPS_HKD）÷ 当日收盘价
+            if (c not in div_series) and cell and cell[2] and cell[2] > 0 and _base:
+                hk_dps = ((fin.get(_base) or {}).get(c) or {}).get("dps")
+                if hk_dps and hk_dps > 0:
+                    div_num += w * hk_dps / cell[2] * 100.0
+                    div_den += w
             if g is None or g <= 0:
                 continue
             # 与实时分析同一口径：当日总市值 ÷ 当日已披露的最新 TTM 归母净利
-            cell = (pe_map.get(c) or {}).get(d)
             pe = None
             if cell and cell[1] and np_ttm and np_ttm > 0:
-                pe = cell[1] / np_ttm            # cell = (pe_ttm, mktcap, close)
+                pe = cell[1] / np_ttm            # cell = (pe_ttm, mktcap, close, pb, ps)
             if pe is None or pe <= 0:            # 兜底：东财当日 PE_TTM
                 pe = cell[0] if cell else None
             if pe is None or pe <= 0:
@@ -1091,6 +1571,20 @@ def backfill_etf(etf_code: str, days: int = 180, on_stage=None,
             n_valid += 1
             np_now += np_ttm
             np_pre += np_ttm_prev
+            # PB：A 股用当日 PB_MRQ 列（老数据可能为 NULL）；港股自算市值÷净资产
+            # 净资产按 PIT 基准期取（当日之前最新已披露的归母净资产）
+            pb_i = cell[3] if cell else None
+            if not pb_i and _base:
+                eq = ((fin.get(_base) or {}).get(c) or {}).get("equity")
+                if eq and eq > 0 and cell and cell[1] and cell[1] > 0:
+                    pb_i = cell[1] / eq
+            if pb_i and pb_i > 0:
+                pb_num += w
+                pb_den += w / pb_i
+            # PS：市值 ÷ TTM 营收（_rev 与净利同一套报告构造）
+            if _rev and _rev > 0 and cell and cell[1] and cell[1] > 0:
+                ps_num += w
+                ps_den += w * _rev / cell[1]     # w / PS_i = w·rev/mc
 
         if den <= 0 or not w_sum:
             continue
@@ -1106,6 +1600,10 @@ def backfill_etf(etf_code: str, days: int = 180, on_stage=None,
             "peg": (pe_etf / g) if (g and g > 0) else None,
             "coverage": (w_sum / w_avail * 100.0) if w_avail else 0.0,
             "n_valid": n_valid, "n_total": len(wmap), "report_date": rep,
+            "pb": (pb_num / pb_den) if pb_den > 0 else None,
+            "ps": (ps_num / ps_den) if ps_den > 0 else None,
+            "div_yield": (div_num / div_den) if div_den > 0 else None,
+            "div_calc": 1 if div_ready else 0,
         })
 
     if out:
@@ -1208,3 +1706,39 @@ def analyze_many(etf_list: List[dict], growth_mode: str = "ttm",
     except Exception:                                   # noqa: BLE001
         pass
     return out
+
+
+def batch_backfill_rank(top: int = 160, on_progress=None, cancel=None) -> dict:
+    """
+    为「PE 历史百分位排行」批量准备数据。
+
+    排行的数据源是 etf_daily 的逐日快照——只有分析过 / 回填过历史的
+    ETF 才有 PE 序列，默认只覆盖几十只。本任务按流通市值取前 top 只
+    场内 ETF（剔除债券/商品/货币等无股票持仓的），逐只回填全可用历史
+    （约 8.6 年，上游个股每日 PE 最早 2018-01-02），把排行覆盖面从
+    「恰好回填过的几十只」滚雪球到「规模前 top 只」。
+
+    单只首次约 1~5 分钟（个股历史 PE 已初始化时，耗时大头是本地逐日
+    计算），全量几十只需数十分钟到数小时。backfill_etf 的增量机制保证：
+    已算满的直接秒回，中断后重跑自动续传，重复执行没有额外成本。
+    on_progress(done, total, label)
+    """
+    prog = on_progress or (lambda *a: None)
+    etfs = ds.fetch_etf_list()              # 已按规模（市值）降序
+    targets = [e for e in etfs
+               if not any(k in e["name"] for k in ds.SKIP_KEYWORDS)][:max(1, top)]
+    total = len(targets)
+    ok = 0
+    failed: List[str] = []
+    for i, e in enumerate(targets, 1):
+        if cancel and cancel():
+            break
+        prog(i - 1, total, f"回填 {e['name']}（{e['code']}）历史 {i}/{total}")
+        try:
+            backfill_etf(e["code"], days=3650, cancel=cancel)
+            ok += 1
+        except Exception:                               # noqa: BLE001
+            failed.append(e["code"])                    # 单只失败不影响整体，重跑续传
+    prog(total, total, "完成")
+    return {"total": total, "ok": ok, "failed": len(failed),
+            "failed_codes": failed[:10], "cancelled": bool(cancel and cancel())}

@@ -26,6 +26,34 @@ def _bar(pct, label="") -> None:
     sys.stdout.flush()
 
 
+def _kill_stale_instances(port: int) -> None:
+    """
+    启动服务前清理残留的旧 run.py 进程（Windows）。
+
+    run.py 用 SQLite（WAL）+ 固定端口，一旦上一次实例没退干净（黑窗口被强杀、
+    或此前用隐藏窗口方式启动的），新实例就会和旧实例抢同一个数据库写锁，
+    表现为启动时报 `database is locked`、回填卡死。
+
+    这里按「谁占着目标端口」来判断旧实例并结束它：只杀监听该端口的进程，
+    绝不会误伤当前启动链路（py.exe 启动器 / 新 python 进程都还没监听端口）。
+    清理失败静默降级，不阻断启动。
+    """
+    if sys.platform != "win32":
+        return
+    import subprocess
+    ps = (
+        f"$c = Get-NetTCPConnection -LocalPort {port} -State Listen "
+        f"-ErrorAction SilentlyContinue; "
+        f"if ($c) {{ $c | Select-Object -ExpandProperty OwningProcess -Unique | "
+        f"ForEach-Object {{ Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }} }}"
+    )
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                        "-Command", ps], capture_output=True, timeout=20)
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
 def run_cli(code: str, mode: str) -> None:
     print("载入行情与财报（首次较慢，之后读本地库）...")
     r = peg.analyze_etf(code, code, mode)
@@ -76,6 +104,12 @@ def main() -> None:
                     help="初始化：拉取全市场 A 股的历史 PE（约 2 小时，中断后重跑自动续传）")
     ap.add_argument("--init-hk", action="store_true",
                     help="初始化：拉取全市场港股的历史行情与财报（约 1 小时，可续传）")
+    ap.add_argument("--init-valuation", action="store_true",
+                    help="重拉全市场历史估值补齐 PB/PS/PCF 列（约 2 小时，可续传；"
+                         "升级老库后执行一次，历史分位功能需要）")
+    ap.add_argument("--init-div", action="store_true",
+                    help="初始化：拉取全市场 A 股的历次现金分红（约 20 分钟，可续传；"
+                         "股息率历史柱状图需要）")
     ap.add_argument("--no-open", action="store_true", help="启动后不自动打开浏览器")
     args = ap.parse_args()
 
@@ -165,6 +199,40 @@ def main() -> None:
                  r["coverage"]["done"], r["coverage"]["total"]))
         return
 
+    if args.init_valuation:
+        from etf_peg import store as _st
+        cov = _st.pb_pending(_st.known_pe_codes())
+        print("重初始化：把存量历史估值补齐 PB / PS / PCF 列（历史分位功能需要）")
+        print(f"  待重拉：{len(cov)} 只（全市场共享一份数据，约 1.5~2 小时）")
+        print("  中断后重跑会自动续传；单只失败不影响整体\n")
+        try:
+            r = ds.init_all_stock_valuation(
+                on_progress=lambda done, total, label: _bar(
+                    done / total * 100 if total else 0, label))
+        except KeyboardInterrupt:
+            print("\n\n已中断。已重拉的部分已入库，下次运行会继续。")
+            return
+        print("\n\n完成：本次重拉 %d 只，失败 %d 只。"
+              % (r["newly_done"], r["failed"]))
+        return
+
+    if args.init_div:
+        from etf_peg import store as _st
+        cov = _st.div_coverage()
+        print("初始化：把全市场 A 股的历次现金分红拉进本地库（股息率历史柱状图需要）")
+        print(f"  当前覆盖：{cov['done']}/{cov['total']} 只")
+        print("  中断后重跑会自动续传；单只失败不影响整体\n")
+        try:
+            r = ds.init_all_stock_div(
+                on_progress=lambda done, total, label: _bar(
+                    done / total * 100 if total else 0, label))
+        except KeyboardInterrupt:
+            print("\n\n已中断。已拉取的部分已入库，下次运行会继续。")
+            return
+        print("\n\n完成：本次新拉 %d 只，失败 %d 只。"
+              % (r["newly_done"], r["failed"]))
+        return
+
     if args.backfill:
         code = args.backfill
         print(f"回填 {code} 近 {args.days} 天的历史 PE/PEG …\n")
@@ -186,6 +254,8 @@ def main() -> None:
         run_cli(args.cli, args.mode)
         return
 
+    # 启动服务前清掉上一次没退干净的实例，避免多进程抢数据库锁 / 端口
+    _kill_stale_instances(args.port)
     start_server(host=args.host, port=args.port, open_browser=not args.no_open)
 
 

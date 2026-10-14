@@ -72,6 +72,10 @@
   .spinner{display:inline-block;width:13px;height:13px;border:2px solid var(--line);
     border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}
   @keyframes sp{to{transform:rotate(360deg)}}
+  .bfst{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:10px;font-size:12px;vertical-align:middle}
+  .bfst-run{background:rgba(240,180,60,.12);color:#f0b43c}
+  .bfst-ok{background:rgba(63,185,80,.12);color:#3fb950}
+  .bfst-fail{background:rgba(248,81,73,.12);color:#f85149}
   .empty{color:var(--dim);text-align:center;padding:34px;font-size:13px}
   footer{color:var(--dim);font-size:12px;text-align:center;margin-top:26px;line-height:1.9}
 </style>
@@ -179,6 +183,7 @@
     <div id="r-chart" style="display:none;margin-top:22px">
       <div class="hd" style="margin-bottom:10px">
         <h2>历史 PEG</h2>
+        <span class="bfst" id="bfStatus" style="display:none"></span>
         <span style="display:flex;gap:8px;align-items:center">
           <select id="histBy" style="padding:6px 9px;font-size:12.5px">
             <option value="year">按年</option>
@@ -188,7 +193,10 @@
           <select id="histMetric" style="padding:6px 9px;font-size:12.5px">
             <option value="peg" selected>PEG</option>
             <option value="pe">PE</option>
+            <option value="pb">PB</option>
+            <option value="ps">PS</option>
             <option value="g_ttm">增速%</option>
+            <option value="div_yield">股息率%</option>
           </select>
         </span>
       </div>
@@ -201,6 +209,14 @@
         <span class="muted">每个报告期各算一次组合 TTM 同比</span>
       </div>
       <div id="r-series-body"></div>
+    </div>
+
+    <div id="r-val" style="display:none;margin-top:22px">
+      <div class="hd" style="margin-bottom:8px">
+        <h2>估值分布与水分</h2>
+        <span class="muted">多指标交叉验证 · 盈利/亏损、正/负增长样本分开统计</span>
+      </div>
+      <div id="r-val-body"></div>
     </div>
 
     <div id="r-history" style="display:none;margin-top:22px">
@@ -238,6 +254,58 @@
         </tr></thead>
         <tbody></tbody>
       </table>
+    </div>
+  </div>
+
+  <!-- PE 历史百分位排行 -->
+  <div class="card">
+    <div class="hd">
+      <h2>全市场 ETF · PE 历史百分位排行</h2>
+      <span style="display:flex;gap:8px;align-items:center">
+        <select id="rankYears" style="padding:7px 10px;font-size:13px">
+          <option value="5" selected>近 5 年窗口</option>
+          <option value="3">近 3 年窗口</option>
+          <option value="0">成立以来</option>
+        </select>
+        <select id="rankTop" style="padding:7px 10px;font-size:13px">
+          <option value="40" selected>前 40 只</option>
+          <option value="80">前 80 只</option>
+          <option value="160">前 160 只</option>
+        </select>
+        <button class="ghost" id="rankBtn" style="padding:7px 14px;font-size:13px">刷新排行</button>
+      </span>
+    </div>
+    <div class="muted" id="rankInfo">计算中…</div>
+    <div class="tbl-wrap" id="rankWrap" style="display:none;margin-top:14px">
+      <table id="rankTbl">
+        <thead><tr>
+          <th class="l">#</th>
+          <th class="l">ETF</th><th class="l">代码</th>
+          <th data-k="pe">当前 PE</th>
+          <th data-k="pct">历史百分位%</th>
+          <th data-k="days">样本天数</th>
+          <th data-k="coverage">覆盖率%</th>
+          <th data-k="peg">PEG</th>
+          <th class="l">快照日</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+      <div class="hd" style="margin-bottom:8px">
+        <h2 style="font-size:15px">排行数据准备（批量回填）</h2>
+        <span style="display:flex;gap:8px;align-items:center">
+          <button class="ghost" id="rankBfBtn" style="padding:6px 12px;font-size:12.5px">回填规模前 <span id="rankBfN">40</span> 只的历史</button>
+          <button class="ghost" id="rankBfCancelBtn" style="padding:6px 12px;font-size:12.5px;display:none">取消</button>
+        </span>
+      </div>
+      <div class="bar" id="rankBfBar" style="display:none"><i></i></div>
+      <div class="muted" id="rankBfNote" style="font-size:12.5px">
+        排行只覆盖已有 PE 历史序列的 ETF（分析过 / 回填过的）。此任务按流通市值取前 N 只场内 ETF
+        （剔除债券/商品/货币类），逐只回填全可用历史（约 8.6 年）。
+        单只首次约 1~5 分钟，全量数十分钟到数小时；中断重跑自动续传，已算满的秒回。
+        与「历史回填 / 初始化」共用同一个后台任务槽，不能并行。
+      </div>
     </div>
   </div>
 
@@ -285,7 +353,43 @@
           所以这里拉的是每日收盘价 / 市值 + 各期财报，写入<strong>独立的港股库</strong>。
           完成后含港股的基金（如持仓里有腾讯、中海油的那些）才能把港股真正算进 PEG。
           首次约 40~60 分钟，支持断点续传；港股库约 0.8 GB。
-          港股财报为<strong>半年度</strong>口径，增速更新比 A 股慢半年，属正常现象。
+          港股财报按<strong>各公司自身财年</strong>处理（12/3/6/9 月年结全覆盖，
+          年报/中报为主、部分公司有季报），3 月年结公司不再遗漏；
+          未定稿的报告期每 6 小时自动刷新。
+        </div>
+
+        <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+          <div class="hd" style="margin-bottom:8px">
+            <h2 style="font-size:15px">估值重初始化（PB / PS / PCF）</h2>
+            <span style="display:flex;gap:8px;align-items:center">
+              <button class="ghost" id="initValBtn" style="padding:6px 12px;font-size:12.5px">开始重初始化</button>
+              <button class="ghost" id="initValCancelBtn" style="padding:6px 12px;font-size:12.5px;display:none">取消</button>
+            </span>
+          </div>
+          <div class="muted" id="valCov" style="font-size:12.5px">加载中…</div>
+          <div class="bar" id="initValBar" style="display:none"><i></i></div>
+          <div class="muted" style="font-size:12px;margin-top:8px">
+            老库里已入库的历史估值没有 PB / PS / PCF 列，本任务把<strong>缺列的股票</strong>逐只全历史重拉补齐
+            （UPSERT 只补缺列，不动已有数据）。历史分位、PB 交叉验证都需要它。
+            只在完成过「全市场 PE 初始化」的库上运行；约 1.5~2 小时，支持断点续传。
+          </div>
+        </div>
+
+        <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+          <div class="hd" style="margin-bottom:8px">
+            <h2 style="font-size:15px">分红数据初始化（股息率）</h2>
+            <span style="display:flex;gap:8px;align-items:center">
+              <button class="ghost" id="initDivBtn" style="padding:6px 12px;font-size:12.5px">开始初始化</button>
+              <button class="ghost" id="initDivCancelBtn" style="padding:6px 12px;font-size:12.5px;display:none">取消</button>
+            </span>
+          </div>
+          <div class="muted" id="divCov" style="font-size:12.5px">加载中…</div>
+          <div class="bar" id="initDivBar" style="display:none"><i></i></div>
+          <div class="muted" style="font-size:12px;margin-top:8px">
+            一次性把全市场 A 股的<strong>历次现金分红</strong>（除息日 + 每股派息）拉进本地库。
+            完成后任意 ETF 的「股息率%」历史柱状图才有数据（个股股息率 = 近 12 个月累计每股分红 ÷ 当日股价，按持仓权重加权）。
+            约 5500 只、单只 1 次请求，限流下约 10~20 分钟；支持断点续传，从未分红的股票自动跳过。
+          </div>
         </div>
       </div>
     </div>
@@ -447,6 +551,7 @@ async function analyze(code) {
     $('#r-warn').style.display = 'none';
     $('#r-basis').style.display = 'none';
     $('#r-series').style.display = 'none';
+    $('#r-val').style.display = 'none';
     $('#r-history').style.display = 'none';
     $('#r-chart').style.display = 'none';
     $('#r-bf').style.display = 'none';
@@ -458,7 +563,9 @@ async function analyze(code) {
 function renderResult(d, mode) {
   $('#r-title').textContent = `${d.name} (${d.code})`;
   $('#r-meta').textContent =
-    (d.fund_type ? `${d.fund_type} · ` : '')
+    (d.feeder_from
+      ? `已穿透：${d.feeder_from.name}（联接基金）→ 目标 ETF ${d.name} · ` : '')
+    + (d.fund_type ? `${d.fund_type} · ` : '')
     + `持仓期 ${d.report_date || '—'} · 财报期 ${d.fin_period || '—'}`
     + (d.equity_ratio != null ? ` · 股票仓位 ${d.equity_ratio.toFixed(0)}%` : '')
     + (d.n_oversea ? ` · 港股美股 ${d.n_oversea} 只` : '')
@@ -478,6 +585,16 @@ function renderResult(d, mode) {
      c: d.coverage >= 70 ? 'g' : (d.coverage >= 50 ? 'w' : 'b')},
     {k: '全样本增速（TTM·同比）', v: d.g_all, n: '含负增长成分股，衡量剔除偏差', d: 2, u: '%',
      c: d.g_all > 0 ? 'g' : 'b'},
+    ...(d.pb != null ? [{k: 'PB（整体法）', v: d.pb, d: 2,
+      n: d.pb_coverage != null && d.pb_coverage < 100 ? `Σw/Σ(w/PB) · 样本覆盖 ${d.pb_coverage.toFixed(0)}%`
+        : 'Σw/Σ(w/PB)；周期底部 PE 失真时的主要参照',
+      c: d.pb_coverage != null && d.pb_coverage < 50 ? 'b' : ''}] : []),
+    ...(d.ps != null ? [{k: 'PS（市销率·TTM）', v: d.ps, d: 2,
+      n: d.ps_coverage != null && d.ps_coverage < 100 ? `市值÷TTM营收 · 覆盖 ${d.ps_coverage.toFixed(0)}%`
+        : '市值 ÷ TTM 营收，与 PE 同源同基准'}] : []),
+    ...(d.peg_all != null ? [{k: '全样本 PEG', v: d.peg_all, d: 2,
+      n: `同一 PE ÷ 全样本增速；亏损股 ${fmt(d.loss_weight, 1)}% / 负增长股 ${fmt(d.negg_weight, 1)}% 被剔除`,
+      c: d.peg && d.peg_all > d.peg * 1.5 ? 'b' : 'w'}] : []),
     ...(d.fund_type ? [{
       k: '股票仓位', v: d.equity_ratio, d: 1, u: '%',
       n: `${d.fund_type} · A股 ${d.n_a} 只`
@@ -497,6 +614,7 @@ function renderResult(d, mode) {
 
   renderBasis(d);
   renderSeries(d);
+  renderValuation(d);
 
   $('#r-count').textContent = `共 ${d.n_total} 只，点击表头可排序`;
   drawTable(d);
@@ -550,6 +668,184 @@ function renderSeries(d) {
       若每期都按各自的「有效样本」算，被剔除的公司逐期不同，趋势会失真。
       上方指标卡的增速是有效样本口径，两者之差即剔除偏差。
     </div>`;
+}
+
+/* ---------------- 估值分布与水分 ---------------- */
+function plCell(v) {
+  if (v == null) return '—';
+  const c = v <= 30 ? 'g' : (v >= 70 ? 'b' : 'w');
+  return `<span class="${c}">${fmt(v, 0)}%</span>`;
+}
+function plTable(d) {
+  const pl = d.percentile;
+  if (!pl) return '';
+  const rows = [
+    {k: 'PE-TTM', cur: d.pe, v: pl.pe, lo: 0, hi: null},
+    {k: 'PB', cur: d.pb, v: pl.pb, lo: 0, hi: null},
+    {k: 'PS', cur: d.ps, v: pl.ps, lo: 0, hi: null},
+  ].filter(r => r.v);
+  if (!rows.length) {
+    return `<div class="muted" style="font-size:12px;margin-bottom:10px">
+      历史分位：该 ETF 的每日快照还不足（或 PB/PS 序列尚未回填）。
+      执行「历史回填」并完成「估值重初始化（PB/PS）」后，这里会显示当前 PE/PB/PS
+      在全部 / 5 年 / 3 年窗口中的分位。</div>`;
+  }
+  return `
+    <div class="tbl-wrap" style="max-height:none">
+      <table style="font-size:12.5px">
+        <thead><tr>
+          <th class="l">指标</th><th>当前值</th><th>全历史分位</th><th>5 年分位</th><th>3 年分位</th>
+        </tr></thead>
+        <tbody>${rows.map(r => `
+          <tr>
+            <td class="l">${r.k}</td>
+            <td>${fmt(r.cur, 2)}</td>
+            <td>${plCell(r.v.all)}</td>
+            <td>${plCell(r.v.y5)}</td>
+            <td>${plCell(r.v.y3)}</td>
+          </tr>`).join('')}</tbody>
+      </table>
+    </div>
+    <div class="muted" style="font-size:12px;margin:8px 0 10px">
+      分位 = 当前值低于历史上多少比例的交易日（基于每日快照，随回填区间增长）。
+      <span class="g">绿</span>=低位（相对自身历史偏便宜），<span class="b">红</span>=高位（偏贵）；
+      PE 中低位但 PB 高位 → 警惕周期顶部，反之亦然，需交叉验证。
+    </div>`;
+}
+
+function renderValuation(d) {
+  const box = $('#r-val'), v = d.dist;
+  if (!v || !v.profit) { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+
+  const metrics = [
+    {k: 'PB（市净率）', v: d.pb, cov: d.pb_coverage, u: '',
+     n: 'Σw/Σ(w/PB)。周期底部 PE 为负或极高时，PB 是主要参照'},
+    {k: 'PS（市销率·TTM）', v: d.ps, cov: d.ps_coverage, u: '',
+     n: '市值 ÷ TTM 营收，与 PE 同一套财报同源同基准'},
+    {k: '股息率（加权）', v: d.div_yield, cov: null, u: '%',
+     n: '近一年分红 ÷ 现价，按持仓权重加权；A股历史分红口径暂缺'},
+    {k: 'EV/EBIT（近似口径）', v: d.ev_ebit, cov: null, u: '',
+     n: '仅港股成分：EV=市值+总负债−现金，EBIT=TTM营业利润；A 股缺负债明细，用 PCF 补充'},
+    {k: 'PCF（市现率·TTM）', v: d.pcf, cov: null, u: '',
+     n: '市值 ÷ TTM 经营现金流，A 股 EV 的替代口径'},
+    {k: '等权 PE', v: d.pe_equal, cov: null, u: '',
+     n: '有效样本算术平均；与整体法差距越大，说明结果被权重股拉偏越多'},
+  ].filter(m => m.v !== null && m.v !== undefined);
+  const mrows = metrics.map(m => `
+    <tr>
+      <td class="l">${m.k}</td>
+      <td class="${m.u ? 'g' : ''}">${fmt(m.v, 2)}${m.u}</td>
+      <td>${m.cov != null ? pct(m.cov, 0) : '—'}</td>
+      <td class="l muted" style="font-size:12px">${m.n}</td>
+    </tr>`).join('');
+
+  const distRows = [
+    {g: '盈利股（净利>0）', n: v.profit.n, w: v.profit.weight,
+     pe_med: v.profit.pe_med, pe_harm: v.profit.pe_harm, g_med: null, c: 'g'},
+    {g: '亏损股（净利≤0）', n: v.loss.n, w: v.loss.weight,
+     pe_med: null, pe_harm: null, g_med: null, c: 'b'},
+    {g: '正增长股', n: v.growth_pos.n, w: v.growth_pos.weight,
+     pe_med: null, pe_harm: null, g_med: v.growth_pos.g_med, c: 'g'},
+    {g: '负增长股', n: v.growth_neg.n, w: v.growth_neg.weight,
+     pe_med: null, pe_harm: null, g_med: v.growth_neg.g_med, c: 'b'},
+  ].map(r => `
+    <tr>
+      <td class="l">${r.g}</td>
+      <td>${r.n}</td>
+      <td class="${r.c}">${pct(r.w, 1)}</td>
+      <td>${r.pe_med != null ? fmt(r.pe_med, 1) : '—'}</td>
+      <td>${r.pe_harm != null ? fmt(r.pe_harm, 1) : '—'}</td>
+      <td class="${r.g_med != null ? r.c : ''}">${r.g_med != null ? fmt(r.g_med, 1) : '—'}</td>
+    </tr>`).join('');
+
+  let water;
+  if (d.peg && d.peg_all) {
+    const up = (d.peg_all / d.peg - 1) * 100;
+    water = `全样本 PEG <strong>${fmt(d.peg_all, 2)}</strong>，比当前有效口径（${fmt(d.peg, 2)}）高 `
+      + `<strong>${fmt(up, 0)}%</strong>；亏损股 ${pct(d.loss_weight, 1)}、负增长股 ${pct(d.negg_weight, 1)} `
+      + `的权重被剔除在计算之外。`
+      + (up > 50 ? '当前 PEG 明显依赖「只留正增长」这一隐含假设，水分较大，请结合 PB/PS 与全样本口径综合判断。'
+                 : '当前 PEG 对样本口径不敏感，相对可信。');
+  } else if (d.peg && d.g_all !== null && d.g_all <= 0) {
+    water = `全样本增速为 ${fmt(d.g_all, 1)}%（非正），全样本口径下组合并不增长——`
+      + `当前 PEG ${fmt(d.peg, 2)} 完全建立在剔除 ${pct((d.loss_weight || 0) + (d.negg_weight || 0), 1)} `
+      + `亏损/负增长权重之上，参考价值有限，PB/PS/EV 等绝对估值指标更可靠。`;
+  } else {
+    water = '全样本口径暂不可比。';
+  }
+
+  const fwd = d.forward;
+  const fwdHtml = (fwd && fwd.pe_f) ? `
+    <div class="tbl-wrap" style="max-height:none">
+      <table style="font-size:12.5px">
+        <thead><tr><th class="l">前瞻指标（${fwd.y1}E→${fwd.y3}E 机构一致预期）</th><th>值</th><th class="l">口径</th></tr></thead>
+        <tbody>
+          <tr><td class="l">前瞻 PE（${fwd.y1}E 预期净利）</td><td><b>${fmt(fwd.pe_f, 2)}</b></td>
+              <td class="l muted" style="font-size:12px">Σw/Σ(w/市值÷${fwd.y1}E 一致预期净利)，仅 A 股成分</td></tr>
+          <tr><td class="l">预期净利 CAGR（${fwd.y1}→${fwd.y3}）</td>
+              <td class="${fwd.cagr > 0 ? 'g' : 'b'}"><b>${fmt(fwd.cagr, 1)}%</b></td>
+              <td class="l muted" style="font-size:12px">组合一致预期净利润两年复合增速</td></tr>
+          <tr><td class="l">前瞻 PEG</td><td><b>${fmt(fwd.peg_f, 3)}</b></td>
+              <td class="l muted" style="font-size:12px">前瞻 PE ÷ CAGR。增速若从预期水平回落，前瞻 PEG 会立刻抬升——与 TTM 口径的 ${fmt(d.peg, 2)} 对照看</td></tr>
+          <tr><td class="l">一致预期覆盖</td>
+              <td class="${fwd.cons_weight != null && fwd.cons_weight >= 70 ? 'g' : 'b'}">${pct(fwd.cons_weight, 0)}</td>
+              <td class="l muted" style="font-size:12px">有预测数据的 A 股权重占比（${fwd.n_used} 只）；港股无免费一致预期数据源，不计入</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="muted" style="font-size:12px;margin:8px 0 10px">
+      前瞻口径回答的是「若预期兑现，当前价格贵不贵」；TTM 口径回答的是「过去一年已兑现的增长贵不贵」。
+      两者差距越大，当前价格越依赖预期兑现。
+    </div>` : '';
+
+  const erp = d.erp;
+  const erpHtml = (erp && erp.value != null) ? `
+    <div class="tbl-wrap" style="max-height:none">
+      <table style="font-size:12.5px">
+        <thead><tr><th class="l">股债性价比（ERP）</th><th>值</th><th class="l">口径</th></tr></thead>
+        <tbody>
+          <tr><td class="l">盈利收益率（1/PE）</td><td><b>${fmt(100 / d.pe, 2)}%</b></td>
+              <td class="l muted" style="font-size:12px">整体法 PE = ${fmt(d.pe, 2)} 的倒数</td></tr>
+          <tr><td class="l">10 年期国债收益率</td><td><b>${fmt(erp.y10, 2)}%</b></td>
+              <td class="l muted" style="font-size:12px">${erp.y10_date || '—'}（无风险利率）</td></tr>
+          <tr><td class="l">股权风险溢价 ERP</td>
+              <td class="${erp.value >= 0 ? 'g' : 'b'}"><b>${fmt(erp.value, 2)}%</b></td>
+              <td class="l muted" style="font-size:12px">盈利收益率 − 无风险利率，越高=股相对债越便宜</td></tr>
+          <tr><td class="l">ERP 历史分位</td>
+              <td>${erp.pct != null ? plCell(100 - erp.pct) : '—'}</td>
+              <td class="l muted" style="font-size:12px">${erp.pct != null
+                ? `当前 ERP 高于历史上 ${fmt(erp.pct, 0)}% 的交易日（分位高=风险补偿厚=股相对便宜）`
+                : '本 ETF 的每日快照不足 60 天，暂无法算分位'}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="muted" style="font-size:12px;margin:8px 0 10px">
+      ERP 高位 → 成长股估值中枢上移有支撑；ERP 低位 → 利率上行对高估值板块的杀伤更大。
+      信用利差暂无免费数据源，未纳入。
+    </div>` : '';
+
+  $('#r-val-body').innerHTML = `
+    ${fwdHtml}
+    ${erpHtml}
+    ${plTable(d)}
+    ${mrows ? `
+    <div class="tbl-wrap" style="max-height:none">
+      <table style="font-size:12.5px">
+        <thead><tr><th class="l">指标</th><th>值</th><th>权重覆盖</th><th class="l">口径说明</th></tr></thead>
+        <tbody>${mrows}</tbody>
+      </table>
+    </div>` : ''}
+    <div class="tbl-wrap" style="max-height:none;${mrows ? 'margin-top:12px' : ''}">
+      <table style="font-size:12.5px">
+        <thead><tr>
+          <th class="l">样本组</th><th>只数</th><th>权重%</th>
+          <th>PE中位</th><th>PE整体法</th><th>增速中位%</th>
+        </tr></thead>
+        <tbody>${distRows}</tbody>
+      </table>
+    </div>
+    <div class="note" style="margin-top:10px">💧 ${water}</div>`;
 }
 
 /* ---------------- 增速计算依据 ---------------- */
@@ -631,7 +927,7 @@ let jobTimer = null, jobTick = null, jobDone = null,
 /* 服务端同一时刻只跑一个 _JOB 任务。任务进行中把「启动」按钮全禁用，
    一来不会撞上 409，二来用户也不会误以为两者能并行。 */
 function setJobBusy(busy) {
-  ['#initBtn', '#initHkBtn', '#bfBtn'].forEach(sel => {
+  ['#initBtn', '#initHkBtn', '#bfBtn', '#rankBfBtn'].forEach(sel => {
     const b = $(sel);
     if (b) b.disabled = busy;
   });
@@ -761,6 +1057,16 @@ let HIST = { daily: [], by_year: [], by_quarter: [], by_month: [] };
 ['histBy', 'histMetric'].forEach(id =>
   $('#' + id).onchange = () => drawHist());
 
+/* 回填状态徽标：让「历史估值生成到哪一步了」在页面上可见 */
+function setBfStatus(state, text) {
+  const el = $('#bfStatus');
+  if (!el) return;
+  if (!text) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  el.className = 'bfst bfst-' + state;
+  el.innerHTML = (state === 'run' ? '<span class="spinner"></span>' : '') + text;
+}
+
 async function loadHistory(code) {
   // 只读：取已有历史（日线 + 三种聚合一次拿全），不触发回填
   try {
@@ -774,9 +1080,46 @@ async function loadHistory(code) {
         + `，点「回填历史」可补全更长区间`;
       drawHist();
       renderDaily();
+      if (d.length >= 60) {
+        // 历史完整：常驻显示 ✅，让「回填完毕了没有」一眼可见
+        setBfStatus('ok', `历史已就绪 ${d.length} 天（${d[d.length - 1].date} ~ ${d[0].date}）`);
+      } else {
+        setBfStatus('run', `历史仅 ${d.length} 天，自动补全中（PB/PS 分位需要它）…`);
+        pollAutoBackfill(code);
+      }
       return;
     }
   } catch (e) { /* ignore */ }
+  setBfStatus('run', '等待自动回填启动…');
+  pollAutoBackfill(code);
+}
+
+/* 服务端在 /api/analyze 里对历史缺失的 ETF 异步回填；这里轮询状态，
+   完成后自动刷新历史图表。每个 code 最多轮询 2 轮，避免死循环。 */
+const _autobfPolled = {};
+function pollAutoBackfill(code) {
+  const tries = _autobfPolled[code] || 0;
+  if (tries >= 2) {
+    setBfStatus('fail', '自动补全未完成，可手动点「回填历史」');
+    return;
+  }
+  _autobfPolled[code] = tries + 1;
+  const started = Date.now();
+  const timer = setInterval(async () => {
+    let finish = false, err = '';
+    try {
+      const s = (await api('/api/autobf/status')).data || {};
+      if (s.code === code && !s.running) { finish = true; err = s.error || ''; }
+    } catch (e) { /* ignore */ }
+    if (finish || Date.now() - started > 10 * 60 * 1000) {   // 完成或 10 分钟兜底
+      clearInterval(timer);
+      if (err) {
+        setBfStatus('fail', `自动补全失败：${err}`);
+      } else {
+        loadHistory(code);   // 刷新（内部按历史数量设置最终状态）
+      }
+    }
+  }, 3000);
 }
 
 /* ---------------- 导出给 AI（复制 / 下载 .md） ---------------- */
@@ -818,7 +1161,11 @@ function buildAiReport(d, hist, extra) {
     ['名称', d.name], ['代码', d.code], ['基金类型', d.fund_type],
     ['股票仓位', d.equity_ratio != null ? fmt(d.equity_ratio, 1) + '%' : null],
     ['A股/港股/其他', `${d.n_a} / ${d.n_hk} / ${d.n_oversea} 只`],
+    ['持仓完整性', d.holdings_full === false ? '仅季报前十大重仓（样本不完整）' : '全持仓（半年报/年报）'],
   ];
+  if (d.oversea_weight) {
+    info.push(['其他市场权重', fmt(d.oversea_weight, 2) + '%（美股等，无估值数据，未计入）']);
+  }
   if (d.n_hk) {
     info.push(['港股权重', d.hk_weight != null ? fmt(d.hk_weight, 2) + '%' : null]);
     info.push(['港股口径', 'PE 由 当日总市值 ÷ TTM股东应占溢利 自算，财报为半年度']);
@@ -830,6 +1177,9 @@ function buildAiReport(d, hist, extra) {
     ['生成时间', now.toLocaleString('zh-CN')]);
   if (extra && extra.mcap != null) info.push(['基金规模', fmt(extra.mcap / 1e8, 1) + ' 亿元']);
   if (extra && extra.pctDay != null) info.push(['当日涨跌', fmt(extra.pctDay, 2) + '%']);
+  if (d.feeder_from) {
+    info.push(['穿透来源', `本结果由联接基金 ${d.feeder_from.name}（${d.feeder_from.code}）自动穿透而来`]);
+  }
   info.forEach(([k, v]) => L.push(`- ${k}：${v == null || v === '' ? '—' : v}`));
   L.push('');
 
@@ -851,14 +1201,72 @@ function buildAiReport(d, hist, extra) {
     ['PEG（权重加权平均）', fmt(d.peg_weighted_avg, 3), '成分股 PEG 加权平均，易被极端值带偏'],
     ['有效样本覆盖率', fmt(d.coverage, 1) + '%', `${d.n_valid}/${d.n_total} 只参与计算`],
     ['有效样本', `${d.n_valid} / ${d.n_total}`, '正 PE 且正增长的成分股'],
+    ...(d.pb != null ? [['PB（整体法）', fmt(d.pb, 2),
+      `Σw/Σ(w/PB)${d.pb_coverage != null && d.pb_coverage < 100 ? `，样本覆盖 ${fmt(d.pb_coverage, 0)}%` : ''}；周期底部 PE 失真时的主要参照`]] : []),
+    ...(d.ps != null ? [['PS（市销率·TTM）', fmt(d.ps, 2),
+      `市值÷TTM营收${d.ps_coverage != null && d.ps_coverage < 100 ? `，样本覆盖 ${fmt(d.ps_coverage, 0)}%` : ''}`]] : []),
+    ...(d.pcf != null ? [['PCF（市现率·TTM）', fmt(d.pcf, 2), '市值÷TTM经营现金流，A 股 EV 的替代口径']] : []),
+    ...(d.ev_ebit != null ? [['EV/EBIT（近似）', fmt(d.ev_ebit, 2), '仅港股成分：EV=市值+总负债−现金，EBIT=TTM营业利润']] : []),
+    ...(d.div_yield != null ? [['股息率（加权）', fmt(d.div_yield, 2) + '%', '近一年分红÷现价，权重加权']] : []),
+    ...(d.pe_equal != null ? [['等权 PE', fmt(d.pe_equal, 2), '有效样本算术平均，与整体法差距大=权重股拉偏']] : []),
+    ...(d.peg_all != null ? [['全样本 PEG', fmt(d.peg_all, 3),
+      `同一 PE ÷ 全样本增速；亏损股 ${fmt(d.loss_weight, 1)}%、负增长股 ${fmt(d.negg_weight, 1)}% 被剔除`]] : []),
+    ...((d.percentile && Object.keys(d.percentile).length) ? Object.entries(d.percentile).map(([k, v]) => [
+      `${{pe: 'PE', pb: 'PB', ps: 'PS'}[k] || k} 历史分位`,
+      `全历史 ${v.all != null ? fmt(v.all, 0) + '%' : '—'} / 5年 ${v.y5 != null ? fmt(v.y5, 0) + '%' : '—'} / 3年 ${v.y3 != null ? fmt(v.y3, 0) + '%' : '—'}`,
+      '基于每日快照序列；低分位=相对自身历史偏便宜',
+    ]) : []),
+    ...(d.forward && d.forward.pe_f != null ? [
+      [`前瞻 PE（${d.forward.y1}E）`, fmt(d.forward.pe_f, 2), '市值 ÷ 机构一致预期净利，仅 A 股成分'],
+      [`预期净利 CAGR（${d.forward.y1}→${d.forward.y3}）`, fmt(d.forward.cagr, 1) + '%', '一致预期净利润两年复合'],
+      ['前瞻 PEG', fmt(d.forward.peg_f, 3), '前瞻 PE ÷ CAGR，与 TTM 口径 PEG 对照'],
+      ['一致预期覆盖', fmt(d.forward.cons_weight, 0) + '%', `有预测数据的 A 股权重占比（${d.forward.n_used} 只）`],
+    ] : []),
+    ...(d.erp && d.erp.value != null ? [
+      ['盈利收益率（1/PE）', fmt(100 / d.pe, 2) + '%', '整体法 PE 的倒数'],
+      ['10Y 国债收益率', fmt(d.erp.y10, 2) + '%', `无风险利率（${d.erp.y10_date || '—'}）`],
+      ['股权风险溢价 ERP', fmt(d.erp.value, 2) + '%', '盈利收益率 − 无风险利率，越高=股相对债越便宜'],
+      ...(d.erp.pct != null ? [['ERP 历史分位', fmt(d.erp.pct, 0) + '%', '当前 ERP 高于历史上多少比例的交易日']] : []),
+    ] : []),
   ];
   rows.forEach(([k, v, n]) => L.push(`| ${k} | ${v} | ${n} |`));
   L.push('');
 
-  /* ---- 3. 近一年财报摘要 ---- */
-  const fin = gs.slice(0, 4);
+  /* ---- 2.1 成分股分组统计 ---- */
+  if (d.dist && d.dist.profit) {
+    L.push('### 成分股分组统计（盈利/亏损 × 正/负增长）');
+    L.push('');
+    L.push('| 分组 | 只数 | 权重% | PE中位数 | PE调和均值 | 增速中位数% |');
+    L.push('|---|---|---|---|---|---|');
+    const dv = d.dist;
+    L.push(`| 盈利股（净利>0） | ${dv.profit.n} | ${fmt(dv.profit.weight, 2)} | ${fmt(dv.profit.pe_med, 1)} | ${fmt(dv.profit.pe_harm, 1)} | — |`);
+    L.push(`| 亏损股（净利≤0） | ${dv.loss.n} | ${fmt(dv.loss.weight, 2)} | — | — | — |`);
+    L.push(`| 正增长股 | ${dv.growth_pos.n} | ${fmt(dv.growth_pos.weight, 2)} | — | — | ${fmt(dv.growth_pos.g_med, 1)} |`);
+    L.push(`| 负增长股 | ${dv.growth_neg.n} | ${fmt(dv.growth_neg.weight, 2)} | — | — | ${fmt(dv.growth_neg.g_med, 1)} |`);
+    L.push('');
+  }
+
+  /* ---- 2.2 TTM 增速构成 ---- */
+  const fb = d.fin_basis;
+  if (fb && fb.parts && fb.parts.length) {
+    L.push('### TTM 增速构成（计算依据）');
+    L.push('');
+    L.push('| 报告期 | 报告 | 角色 |');
+    L.push('|---|---|---|');
+    fb.parts.forEach(p => L.push(`| ${p.period} | ${p.label} | ${p.role} |`));
+    if (fb.pit && fb.dist && fb.dist.length > 1) {
+      const tot = fb.dist.reduce((s, x) => s + x[1], 0) || 1;
+      L.push('');
+      L.push('> 各公司披露进度不同，基准期按真实披露日逐只对齐（PIT）。实际基准期分布：'
+        + fb.dist.map(x => `${x[0]} × ${x[1]} 家（${(x[1] / tot * 100).toFixed(0)}%）`).join('、') + '。');
+    }
+    L.push('');
+  }
+
+  /* ---- 3. 近五年财报摘要 ---- */
+  const fin = gs.slice(0, 20);
   if (fin.length) {
-    L.push('## 三、近一年财报摘要（组合层面，绝对量 + 增速）');
+    L.push('## 三、近五年财报摘要（组合层面，绝对量 + 增速）');
     L.push('');
     L.push('| 报告期 | 类型 | 组合TTM归母净利(亿元) | 去年同期(亿元) | 全样本增速% | 正增长样本增速% | 样本 |');
     L.push('|---|---|---|---|---|---|---|');
@@ -900,17 +1308,64 @@ function buildAiReport(d, hist, extra) {
     L.push('');
   }
 
+  /* ---- 5.1 前二十大持仓个股逐期增速 ---- */
+  const top20 = (d.stocks || []).slice(0, 20);
+  const bases = (d.fin_basis && d.fin_basis.series_bases) || [];
+  const withSeries = top20.filter(s => s.g_series && s.g_series.length);
+  if (withSeries.length && bases.length) {
+    L.push('### 前二十大持仓个股逐期增速（TTM 归母净利同比%，由新到旧）');
+    L.push('');
+    L.push('| 代码 | 名称 | 权重% | ' + bases.join(' | ') + ' |');
+    L.push('|---|'.repeat(3 + bases.length));
+    withSeries.forEach(s => L.push(
+      `| ${s.code} | ${s.name} | ${fmt(s.weight, 2)} | `
+      + bases.map((_, i) => s.g_series[i] == null ? '—' : s.g_series[i].toFixed(1) + '%').join(' | ')
+      + ' |'));
+    L.push('');
+    L.push('> 期别与「组合增速序列」一致，空值=该期无 TTM 数据（港股半年度财报或缺失）。');
+    L.push('');
+  }
+
+  /* ---- 5.2 前二十大持仓个股逐期财务明细 ---- */
+  const finTop = (d.stocks || []).slice(0, 20);
+  const withFin = finTop.filter(s => s.fin_series && s.fin_series.some(r => r));
+  if (withFin.length && bases.length) {
+    L.push('### 前二十大持仓个股逐期财务明细（累计口径）');
+    L.push('');
+    L.push('> 期别与「组合增速序列」一致，由新到旧；归母净利/营收为报告期**累计值**，同比为**累计同比**，与组合层的 TTM 增速口径不同。空行=该期无数据（港股半年度财报或未披露）。');
+    L.push('');
+    withFin.forEach(s => {
+      L.push(`**${s.name}（${s.code}）**｜权重 ${fmt(s.weight, 2)}%`);
+      L.push('');
+      L.push('| 期别 | 归母净利(亿元) | 同比增速% | 营收(亿元) | EPS | ROE% | 股息率% |');
+      L.push('|---|---|---|---|---|---|---|');
+      bases.forEach((b, i) => {
+        const r = s.fin_series[i];
+        if (!r) return;
+        L.push(`| ${b} | ${r.np != null ? fmt(r.np / 1e8, 1) : '—'}`
+          + ` | ${r.np_yoy != null ? fmt(r.np_yoy, 1) + '%' : '—'}`
+          + ` | ${r.revenue != null ? fmt(r.revenue / 1e8, 1) : '—'}`
+          + ` | ${r.eps != null ? fmt(r.eps, 2) : '—'}`
+          + ` | ${r.roe != null ? fmt(r.roe, 1) + '%' : '—'}`
+          + ` | ${r.div_yield != null ? fmt(r.div_yield, 1) + '%' : '—'} |`);
+      });
+      L.push('');
+    });
+  }
+
   /* ---- 6. 历史月度估值 ---- */
   L.push('## 六、历史月度估值' + (months.length ? `（${months.length} 个月）` : ''));
   L.push('');
   if (months.length) {
-    L.push('| 月末 | PE-TTM | PE区间 | 增速% | PEG | PEG区间 | 覆盖率% |');
-    L.push('|---|---|---|---|---|---|---|');
+    L.push('| 月末 | PE-TTM | PE区间 | 增速% | PEG | PEG区间 | PB | PS | 股息率% | 覆盖率% |');
+    L.push('|---|---|---|---|---|---|---|---|---|---|');
     months.forEach(m => L.push(
       `| ${m.date} | ${fmt(m.pe, 2)}`
       + ` | ${fmt(m.pe_lo, 2)}~${fmt(m.pe_hi, 2)}`
       + ` | ${fmt(m.g_ttm, 2)} | ${fmt(m.peg, 3)}`
       + ` | ${m.peg_lo != null ? fmt(m.peg_lo, 3) + '~' + fmt(m.peg_hi, 3) : '—'}`
+      + ` | ${fmt(m.pb, 2)} | ${fmt(m.ps, 2)}`
+      + ` | ${fmt(m.div_yield, 2)}`
       + ` | ${fmt(m.coverage, 1)} |`));
     if (months.length < 12) {
       L.push('');
@@ -919,7 +1374,7 @@ function buildAiReport(d, hist, extra) {
     }
   } else {
     L.push('> 该基金暂无历史月度数据。在工具界面执行「回填历史」后，'
-      + '这里会给出 2018 年以来逐月的 PE / 增速 / PEG。');
+      + '这里会给出 2018 年以来逐月的 PE / 增速 / PEG / 股息率。');
   }
   L.push('');
 
@@ -934,6 +1389,8 @@ function buildAiReport(d, hist, extra) {
   L.push('- 个股财报按**真实披露日**对齐（point-in-time），避免用到尚未公开的数据');
   L.push('- A 股 PE 为东财 PE-TTM 口径；**港股无现成历史 PE，由 当日总市值 ÷ TTM股东应占溢利 自算**，且港股财报为半年度（中报/年报），更新节奏比 A 股慢半年');
   L.push('- 月度估值的数值取该月**最后一个交易日**，区间为该月最高/最低');
+  L.push('- 月度股息率为该月末时点的组合加权股息率：A 股 = 近 12 个月累计每股分红 ÷ 当日股价（分红明细滚动窗口），港股 = 财报近一年每股分红 ÷ 当日收盘价；亏损/负增长股照样分红，不因其被 PE 剔除而连带剔除');
+  L.push('- 月度 PB/PS 与 PE 同源逐日计算；**周期性行业（有色/光伏/新能源等）判断底部与顶部，PB 分位比 PE/PEG 可靠**——PE 在盈利高峰会失真地低、在盈利谷底会失真地高');
   L.push('- PEG = PE ÷ 增速。PEG<1 只是传统经验值，需结合增速可持续性、行业景气与上述偏差综合判断');
   L.push('');
   L.push('### 局限');
@@ -1041,7 +1498,8 @@ function drawHist() {
   const y = v => PT + (H - PT - PB) * (1 - (v - lo) / rng);
   const iw = (W - PL - PR) / rows.length;
   const bw = Math.max(4, Math.min(56, iw * 0.62));
-  const MNAME = { peg: 'PEG', pe: 'PE-TTM', g_ttm: '增速%' };
+  const MNAME = { peg: 'PEG', pe: 'PE-TTM', pb: 'PB', ps: 'PS', g_ttm: '增速%',
+                  div_yield: '股息率%' };
 
   let bars = '', labels = '', grid = '';
   for (let gy = 0; gy <= 4; gy++) {
@@ -1055,13 +1513,13 @@ function drawHist() {
     if (v != null && isFinite(v)) {
       const y0 = y(0), y1 = y(v);
       const up = v >= 0;
-      const col = metric === 'g_ttm'
+      const col = (metric === 'g_ttm' || metric === 'div_yield')
         ? (up ? '#3fb950' : '#f85149')
         : (up ? '#4f9cf9' : '#f85149');
       bars += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${Math.min(y0, y1).toFixed(1)}"`
         + ` width="${bw.toFixed(1)}" height="${Math.max(1, Math.abs(y1 - y0)).toFixed(1)}"`
         + ` fill="${col}" rx="2"><title>${r.key}｜${MNAME[metric]} ${v.toFixed(metric === 'peg' ? 3 : 2)}`
-        + (metric !== 'g_ttm' ? `｜区间 ${r.pe_lo != null ? r.pe_lo.toFixed(2) : '—'}~${r.pe_hi != null ? r.pe_hi.toFixed(2) : '—'}` : '')
+        + (metric === 'pe' ? `｜区间 ${r.pe_lo != null ? r.pe_lo.toFixed(2) : '—'}~${r.pe_hi != null ? r.pe_hi.toFixed(2) : '—'}` : '')
         + `｜持仓期 ${r.report_date || '—'}｜${r.days || 1} 个交易日</title></rect>`;
     }
     const step = Math.ceil(rows.length / 24);
@@ -1073,9 +1531,11 @@ function drawHist() {
   body.innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;display:block">${grid}${bars}${labels}</svg>`
     + `<div class="muted" style="font-size:11.5px;margin-top:6px">
          共 ${rows.length} 个${by === 'year' ? '年' : by === 'quarter' ? '季度' : '月'}；`
-    + `柱高取该${by === 'year' ? '年' : by === 'quarter' ? '季度' : '月'}<b>最后一个交易日</b>的值，悬停可见区间极值。
-         上游个股每日 PE 最早 2018-01-02，更早无法回填。
-       </div>`;
+    + `柱高取该${by === 'year' ? '年' : by === 'quarter' ? '季度' : '月'}<b>最后一个交易日</b>的值，悬停可见区间极值。`
+    + (metric === 'div_yield'
+        ? `股息率 = 成分股「近 12 个月累计每股分红 ÷ 当日股价」按持仓权重加权；分红数据未初始化时为空白。`
+        : `上游个股每日 PE 最早 2018-01-02，更早无法回填。`)
+    + `</div>`;
 }
 
 /* 每日明细表（保留，取最近 12 条） */
@@ -1091,6 +1551,7 @@ function renderDaily() {
       <td>${fmt(r.pe)}</td>
       <td class="${r.g_ttm > 0 ? 'g' : 'b'}">${pct(r.g_ttm, 1)}</td>
       <td class="${cls(r.peg)}"><b>${fmt(r.peg, 3)}</b></td>
+      <td class="${(r.div_yield ?? 0) >= 3 ? 'g' : ''}">${pct(r.div_yield, 2)}</td>
       <td>${fmt(r.coverage, 0)}</td>
       <td class="l muted">${r.report_date || '—'}</td>
     </tr>`).join('');
@@ -1098,7 +1559,7 @@ function renderDaily() {
     <div class="tbl-wrap" style="max-height:260px">
       <table>
         <thead><tr>
-          <th class="l">日期</th><th>PE</th><th>增速%</th><th>PEG</th><th>覆盖%</th><th class="l">持仓期</th>
+          <th class="l">日期</th><th>PE</th><th>增速%</th><th>PEG</th><th>股息率%</th><th>覆盖%</th><th class="l">持仓期</th>
         </tr></thead>
         <tbody>${tb}</tbody>
       </table>
@@ -1147,7 +1608,7 @@ async function loadCov(url, elId, fallbackHtml) {
     const p = d.total ? (d.done / d.total * 100) : 0;
     $('#' + elId).innerHTML =
       `已拉取 <b>${d.done || 0}</b> / <b>${d.total || 0}</b> 只（${p.toFixed(1)}%）`
-      + `　共 ${(d.rows || 0).toLocaleString()} 行`
+      + (d.rows != null ? `　共 ${(d.rows || 0).toLocaleString()} 行` : '')
       + (d.snapshot_date ? `　清单日期 ${d.snapshot_date}` : '')
       + (d.total && d.done >= d.total ? '　✅ 已完成' : '');
   } catch (e) {
@@ -1203,8 +1664,12 @@ function bindInit(kind, btnId, cancelId, barId, covId, covUrl) {
 
 bindInit('initpe', 'initBtn', 'initCancelBtn', 'initBar', 'peCov', '/api/pe-coverage');
 bindInit('inithk', 'initHkBtn', 'initHkCancelBtn', 'initHkBar', 'hkCov', '/api/hk-coverage');
+bindInit('initvaluation', 'initValBtn', 'initValCancelBtn', 'initValBar', 'valCov', '/api/pb-coverage');
+bindInit('initdiv', 'initDivBtn', 'initDivCancelBtn', 'initDivBar', 'divCov', '/api/div-coverage');
 loadCov('/api/pe-coverage', 'peCov');
 loadCov('/api/hk-coverage', 'hkCov');
+loadCov('/api/pb-coverage', 'valCov');
+loadCov('/api/div-coverage', 'divCov');
 
 /* 刷新页面后，服务端的任务可能还在跑（前端状态全丢了）。
    这里主动查一次，把 UI 直接接回去——不用等用户再点一次按钮。 */
@@ -1424,6 +1889,119 @@ document.querySelectorAll('#scanTbl th[data-k]').forEach(th => th.onclick = () =
   const k = th.dataset.k;
   drawScan(k, SK.k === k ? !SK.asc : true);
 });
+
+/* ---------------- PE 历史百分位排行 ---------------- */
+let RANK = [], RK = {k: 'pct', asc: true};
+
+async function loadPeRank() {
+  const info = $('#rankInfo');
+  info.innerHTML = '<span class="spinner"></span> 计算排行…';
+  try {
+    const j = await api(`/api/pe-rank?years=${$('#rankYears').value}&top=${$('#rankTop').value}`);
+    if (!j.ok) throw new Error(j.error);
+    const d = j.data;
+    RANK = d.rows || [];
+    if (!RANK.length) {
+      $('#rankWrap').style.display = 'none';
+      info.innerHTML = `暂无可排名数据：只有分析过 / 回填过历史的 ETF 才有 PE 序列`
+        + `（当前库里有历史的 ETF 共 ${d.candidates} 只，样本 ≥${d.min_days} 天的 0 只）。`
+        + `请先用下方「排行数据准备」批量回填，覆盖面会随回填扩大。`;
+      return;
+    }
+    const winTxt = $('#rankYears').selectedOptions[0].textContent;
+    info.innerHTML = `有历史快照的 ETF 共 ${d.candidates} 只，样本充足参与排名 ${d.eligible} 只`
+      + `（窗口：${winTxt}，样本 ≥${d.min_days} 个交易日）。`
+      + `百分位 = 当前 PE 在自身历史序列中的位置，越低 = 越接近历史低位；点击名称可跳转分析。`;
+    $('#rankWrap').style.display = 'block';
+    drawRank(RK.k, RK.asc);
+  } catch (e) {
+    info.innerHTML = `<span style="color:var(--bad)">加载失败：${e.message}</span>`;
+  }
+}
+
+function drawRank(k, asc) {
+  RK = {k, asc};
+  const rows = [...RANK].sort((a, b) => {
+    const x = a[k], y = b[k];
+    if (x === null || x === undefined) return 1;
+    if (y === null || y === undefined) return -1;
+    return (x - y) * (asc ? 1 : -1);
+  });
+  $('#rankTbl').querySelector('tbody').innerHTML = rows.map(r => {
+    const cc = r.pct <= 20 ? 'g' : (r.pct >= 80 ? 'b' : '');
+    return `
+    <tr>
+      <td class="l muted">${r.rank}</td>
+      <td class="l"><a href="#" onclick="analyze('${r.code}');return false">${r.name}</a></td>
+      <td class="l mono">${r.code}</td>
+      <td title="区间 ${fmt(r.pe_lo)} ~ ${fmt(r.pe_hi)}">${fmt(r.pe)}</td>
+      <td class="${cc}"><b>${fmt(r.pct, 1)}%</b></td>
+      <td class="${r.days < 250 ? 'w' : ''}" title="窗口内有效 PE 样本 / 快照总数">${r.days}/${r.total_days}</td>
+      <td class="${r.coverage >= 70 ? 'g' : (r.coverage >= 50 ? 'w' : 'b')}">${fmt(r.coverage, 0)}</td>
+      <td class="${cls(r.peg)}">${fmt(r.peg)}</td>
+      <td class="l muted mono" style="font-size:12px">${r.date}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="9" class="empty">无数据</td></tr>';
+}
+document.querySelectorAll('#rankTbl th[data-k]').forEach(th => th.onclick = () => {
+  const k = th.dataset.k;
+  drawRank(k, RK.k === k ? !RK.asc : true);
+});
+$('#rankBtn').onclick = loadPeRank;
+$('#rankYears').onchange = loadPeRank;
+$('#rankTop').onchange = () => {
+  $('#rankBfN').textContent = $('#rankTop').value;
+  loadPeRank();
+};
+loadPeRank();
+
+/* 排行数据准备：批量回填规模前 N 只 ETF 的全可用历史（后台任务，与回填/初始化共用任务槽） */
+{
+  const enter = () => {
+    $('#rankBfBtn').disabled = true;
+    $('#rankBfCancelBtn').style.display = '';
+    $('#rankBfCancelBtn').disabled = false;
+    $('#rankBfBar').style.display = 'block';
+  };
+  const onTick = d => {
+    $('#rankBfBar').querySelector('i').style.width = (d.pct || 0) + '%';
+    $('#rankBfNote').innerHTML =
+      `<span class="spinner"></span> ${(d.pct || 0).toFixed(1)}%　${d.stage || ''}`
+      + (d.total ? `（${d.done}/${d.total} 只）` : '');
+  };
+  const onDone = (d, err) => {
+    $('#rankBfBar').style.display = 'none';
+    $('#rankBfCancelBtn').style.display = 'none';
+    $('#rankBfBtn').disabled = false;
+    if (err) {
+      $('#rankBfNote').innerHTML = `<span style="color:var(--bad)">启动失败：${err.message}</span>`;
+      return;
+    }
+    if (d && d.error) {
+      $('#rankBfNote').innerHTML = `<span style="color:var(--bad)">批量回填失败：${d.error}</span>`;
+      return;
+    }
+    const r = d && d.result;
+    if (!r || d.stage === '已取消') { $('#rankBfNote').textContent = '已取消批量回填'; return; }
+    $('#rankBfNote').textContent =
+      `批量回填结束：${r.ok}/${r.total} 只就绪`
+      + (r.failed ? `，失败 ${r.failed} 只（重跑自动续传补齐）` : '')
+      + '，排行已刷新。';
+    loadPeRank();
+  };
+  JOB_RESUME['batchrank'] = () => { enter(); attachJob('batchrank', onTick, onDone); };
+  $('#rankBfBtn').onclick = () => {
+    enter();
+    $('#rankBfBar').querySelector('i').style.width = '0%';
+    $('#rankBfNote').innerHTML = '<span class="spinner"></span> 正在启动…';
+    startJob('batchrank', 'kind=batchrank&top=' + $('#rankTop').value, onTick, onDone);
+  };
+  $('#rankBfCancelBtn').onclick = () => {
+    fetch('/api/job/cancel');
+    $('#rankBfCancelBtn').disabled = true;
+    $('#rankBfNote').innerHTML = '<span class="spinner"></span> 正在取消…';
+  };
+}
 </script>
 </body>
 </html>

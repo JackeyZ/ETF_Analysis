@@ -30,8 +30,7 @@ _SCAN: Dict[str, object] = {
 _SCAN_LOCK = threading.Lock()
 
 # 债券/商品/货币类 ETF 没有股票持仓，直接跳过，省下大量无效请求
-_SKIP_KW = ("债", "货币", "现金", "黄金", "商品", "豆粕", "有色期",
-            "能源化工", "原油", "豆油", "棕榈", "橡胶", "铁矿", "白银")
+_SKIP_KW = ds.SKIP_KEYWORDS
 
 
 def _eligible_etfs(limit: int) -> List[dict]:
@@ -110,6 +109,15 @@ _JOB: Dict[str, object] = {
 }
 _JOB_LOCK = threading.Lock()
 
+# 分析后的「自动历史回填」独立状态：不占用 _JOB（避免和初始化/回填任务互斥），
+# 后台线程跑，前端轮询 /api/autobf/status 感知完成后刷新历史图表。
+_AUTOBF: Dict[str, object] = {"running": False, "code": "", "done": False, "error": ""}
+_AUTOBF_LOCK = threading.Lock()
+
+# PE 百分位排行的进程内缓存：数据一天最多变一次（收盘后回填/分析更新），
+# 排行计算是全表扫描，30 分钟缓存足够，秒级刷新没有意义。
+_PE_RANK_MEMO: Dict[str, object] = {"key": None, "ts": 0.0, "data": None}
+
 
 def _job_worker(kind: str, **kw) -> None:
     def cancelled() -> bool:
@@ -147,6 +155,15 @@ def _job_worker(kind: str, **kw) -> None:
             result = ds.init_all_stock_pe(on_progress=prog_count, cancel=cancelled)
         elif kind == "inithk":
             result = hk.init_all_hk(on_progress=prog_count, cancel=cancelled)
+        elif kind == "initvaluation":
+            result = ds.init_all_stock_valuation(
+                on_progress=prog_count, cancel=cancelled)
+        elif kind == "initdiv":
+            result = ds.init_all_stock_div(on_progress=prog_count, cancel=cancelled)
+        elif kind == "batchrank":
+            result = peg.batch_backfill_rank(top=int(kw.get("top", 160)),
+                                             on_progress=prog_count,
+                                             cancel=cancelled)
         else:
             raise ValueError(f"未知任务类型：{kind}")
 
@@ -166,6 +183,45 @@ def _job_worker(kind: str, **kw) -> None:
             _JOB["stage"] = ""
 
 
+def _auto_backfill_history(code: str) -> None:
+    """
+    分析后自动补齐该 ETF 的历史月度估值（PE/PB/PS 逐日序列与历史分位）。
+
+    现状：etf_daily 只有在分析时 record 当天一条快照，不「回填」的话，
+    历史月度估值永远只有 1 个月，PB/PS 历史分位也算不出来。这里在历史
+    明显缺失（不足约 3 个月交易日）时，用后台线程异步回填一次全历史——
+    纯 A 股 ETF 约 30 秒，含港股的 ETF 要几分钟，同步做会卡死 analyze 响应。
+    已算满的直接走 backfill_etf 增量判断秒回；失败静默降级，不影响本次分析。
+
+    股息率（div_calc）同理：老库已有 PE/PB/PS 历史但缺股息率列时，也触发
+    一次补算（backfill_etf 的增量判定只重算 div_calc=0 的日期）。
+    """
+    try:
+        hist = store.get_history(code, 99999)
+        if len(hist) >= 60 and all(r.get("div_calc") for r in hist):
+            return
+    except Exception:                                   # noqa: BLE001
+        return
+    with _AUTOBF_LOCK:
+        if _AUTOBF["running"]:
+            return                                    # 已有回填在跑，别叠请求
+        _AUTOBF.update(running=True, code=code, done=False, error="")
+
+    def worker() -> None:
+        try:
+            # 全历史（个股每日 PE 上游最早 2018-01-02，约 8.6 年）
+            peg.backfill_etf(code, days=3650)
+        except Exception as exc:                       # noqa: BLE001
+            with _AUTOBF_LOCK:
+                _AUTOBF["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            with _AUTOBF_LOCK:
+                _AUTOBF["running"] = False
+                _AUTOBF["done"] = True
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 # --------------------------------------------------------------------------- #
 #  请求处理
 # --------------------------------------------------------------------------- #
@@ -179,6 +235,9 @@ class Handler(SimpleHTTPRequestHandler):
         # 没有 CORS 时浏览器会直接拦掉这个探测请求。
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "*")
+        # 静态页与 API 一律禁缓存：整个前端就是单文件 index.html（无外部资源），
+        # 不禁的话浏览器会拿旧 HTML，改版后「界面上没有新功能」多半是它。
+        self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
     def _json(self, obj, status: int = 200):
@@ -260,7 +319,10 @@ class Handler(SimpleHTTPRequestHandler):
                 name = (f or {}).get("name") or code
                 # 行情与财报由 analyze_etf 内部按需载入（各自带缓存 / 本地库），
                 # 不要在这里预拉，否则会多下载一倍用不到的报告期
-                r = peg.analyze_etf(code, name, mode)
+                r = peg.analyze_etf(code, name, mode, series_quarters=20)
+                # 历史缺失时自动回填，让「历史月度估值 / PB·PS 历史分位」完整
+                # （首次约 30~60 秒，之后命中增量判断秒回；失败静默降级）
+                _auto_backfill_history(code)
                 return self._json({"ok": True, "data": asdict(r)})
 
             if path == "/api/scan/start":
@@ -289,6 +351,18 @@ class Handler(SimpleHTTPRequestHandler):
                     snap = dict(_SCAN)
                 return self._json({"ok": True, "data": snap})
 
+            if path == "/api/pe-rank":
+                # 全市场 ETF 的 PE 历史百分位排行（windows=5/3/0 年，0=成立以来）
+                years = float((qs.get("years") or [0])[0] or 0)
+                top = int((qs.get("top") or [40])[0])
+                key = (years, top)
+                now = time.time()
+                if _PE_RANK_MEMO["key"] != key or now - _PE_RANK_MEMO["ts"] > 1800:
+                    _PE_RANK_MEMO["data"] = store.pe_ranking(years=years or None,
+                                                             top=top)
+                    _PE_RANK_MEMO["key"], _PE_RANK_MEMO["ts"] = key, now
+                return self._json({"ok": True, "data": _PE_RANK_MEMO["data"]})
+
             if path == "/api/ping":
                 return self._json({"ok": True, "data": {"pong": True, "ts": time.time()}})
 
@@ -306,7 +380,9 @@ class Handler(SimpleHTTPRequestHandler):
                     days = int(years * 365) if years else int((qs.get("days") or [180])[0])
                     force = (qs.get("force") or [""])[0] in ("1", "true")
                     kw = {"code": code, "days": days, "force": force}
-                elif kind not in ("initpe", "inithk"):
+                elif kind == "batchrank":
+                    kw = {"top": int((qs.get("top") or [160])[0])}
+                elif kind not in ("initpe", "inithk", "initvaluation", "initdiv"):
                     return self._fail("未知任务类型", 400)
 
                 # 关键：立即返回，不要在这儿干等；否则前端 await 不到响应，
@@ -339,6 +415,11 @@ class Handler(SimpleHTTPRequestHandler):
                     snap = dict(_JOB)
                 return self._json({"ok": True, "data": snap})
 
+            if path == "/api/autobf/status":
+                with _AUTOBF_LOCK:
+                    snap = dict(_AUTOBF)
+                return self._json({"ok": True, "data": snap})
+
             if path == "/api/pe-coverage":
                 return self._json({"ok": True,
                                    "data": store.pe_coverage(ds.pe_history_earliest())})
@@ -346,6 +427,15 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/hk-coverage":
                 return self._json({"ok": True,
                                    "data": store.HK.pe_coverage(hk.HK_EARLIEST)})
+
+            if path == "/api/pb-coverage":
+                codes = store.known_pe_codes()
+                todo = store.pb_pending(sorted(codes))
+                return self._json({"ok": True, "data": {
+                    "total": len(codes), "done": len(codes) - len(todo)}})
+
+            if path == "/api/div-coverage":
+                return self._json({"ok": True, "data": store.div_coverage()})
 
             if path == "/api/history":
                 code = (qs.get("code") or [""])[0].strip()

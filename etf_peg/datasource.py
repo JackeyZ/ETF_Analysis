@@ -43,6 +43,10 @@ UA = {
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# 债券/商品/货币类 ETF 没有股票持仓，批量任务（扫描 / 排行数据回填）直接跳过
+SKIP_KEYWORDS = ("债", "货币", "现金", "黄金", "商品", "豆粕", "有色期",
+                 "能源化工", "原油", "豆油", "棕榈", "橡胶", "铁矿", "白银")
+
 
 # --------------------------------------------------------------------------- #
 #  HTTP 基础
@@ -275,6 +279,74 @@ def lookup_fund(code: str) -> Optional[dict]:
         if e["code"] == code:
             return {"code": code, "name": e["name"], "type": "ETF"}
     return None
+
+
+def resolve_feeder_target(code: str, name: str = "") -> Optional[dict]:
+    """
+    联接基金识别与穿透。返回 dict 或 None：
+
+    - 非联接基金 → None
+    - 联接基金 → {"target": {code,name} 或 None, "tracking": 跟踪指数名 或 None}
+
+    背景：ETF 联接基金（如 009068）本身不直接持有股票，而是拿募来的钱
+    去买目标 ETF 份额。它的「股票投资明细」（fundf10 type=jjcc）只残留了
+    2021 年之前过渡期的少量股票，2022 年起就不再披露——直接按 jjcc 分析
+    会拿到五年前的旧持仓，算出完全失真的 PEG。
+
+    穿透策略：先按名称匹配目标 ETF（场内 ETF 简称可能和联接基金全称不一致，
+    匹配失败很常见）；匹配不到时退回「跟踪标的指数」作为提示，交由上层阻断
+    并指引用户搜索对应的场内 ETF。
+    """
+    # 传入的是空名或纯代码时，回源查真实名称（CLI/测试里常只传 code）
+    if not name or name == code or name.isdigit():
+        f = lookup_fund(code)
+        name = (f or {}).get("name") or name
+    if "联接" not in name:
+        return None
+    # 目标 ETF 名称 = 名称在「联接」之前的部分（如
+    # 「国泰中证新能源汽车ETF联接C」 → 「国泰中证新能源汽车ETF」）
+    base = name.split("联接", 1)[0].strip()
+    target: Optional[dict] = None
+    if base:
+        etfs = fetch_etf_list()
+        for e in etfs:
+            if e["name"] == base:
+                target = {"code": e["code"], "name": e["name"]}
+                break
+        if target is None:
+            # 场内 ETF 是简称（如「新能源车ETF国泰」），全称对不上时，
+            # 用「去掉交易所前缀的指数核心词」做包含匹配（如「新能源汽车」→「新能源」）
+            for e in etfs:
+                if "联接" in e["name"]:
+                    continue
+                if base in e["name"] or e["name"] in base:
+                    target = {"code": e["code"], "name": e["name"]}
+                    break
+    # 跟踪标的指数名：拿不到目标 ETF 时，用它指引用户（缓存 7 天，指数不会变）
+    tracking = None
+    if target is None:
+        tracking = _feeder_tracking(code)
+    return {"target": target, "tracking": tracking}
+
+
+def _feeder_tracking(code: str) -> Optional[str]:
+    """从基金概况页抓「跟踪标的」指数名（如 中证新能源汽车指数）。"""
+    key = f"feeder_tracking_{code}"
+    hit = cache_get(key, 7 * 86400)
+    if hit is not None:
+        return hit or None
+    tracking = None
+    try:
+        html = http_get(f"https://fundf10.eastmoney.com/jbgk_{code}.html",
+                        {"Referer": f"https://fund.eastmoney.com/{code}.html"},
+                        timeout=20)
+        m = re.search(r"跟踪标的</th>\s*<td[^>]*>([^<]+)</td>", html)
+        if m:
+            tracking = m.group(1).strip()
+    except Exception:                                   # noqa: BLE001
+        pass
+    cache_put(key, tracking or "")
+    return tracking
 
 
 # --------------------------------------------------------------------------- #
@@ -514,7 +586,10 @@ def ensure_market_pe(max_lag_days: int = 2, force: bool = False) -> Optional[str
                         "pe_ttm": _num(it.get("PE_TTM")),
                         "pe_lar": _num(it.get("PE_LAR")),
                         "mktcap": _num(it.get("TOTAL_MARKET_CAP")),
-                        "close": _num(it.get("CLOSE_PRICE"))})
+                        "close": _num(it.get("CLOSE_PRICE")),
+                        "pb": _num(it.get("PB_MRQ")),
+                        "ps": _num(it.get("PS_TTM")),
+                        "pcf": _num(it.get("PCF_OCF_TTM"))})
         if page * 500 >= int(res.get("count") or 0):
             break
         page += 1
@@ -570,7 +645,10 @@ def fetch_stock_pe(code: str, start_date: str, force: bool = False) -> List[dict
                         "pe_ttm": _num(it.get("PE_TTM")),
                         "pe_lar": _num(it.get("PE_LAR")),
                         "mktcap": _num(it.get("TOTAL_MARKET_CAP")),
-                        "close": _num(it.get("CLOSE_PRICE"))})
+                        "close": _num(it.get("CLOSE_PRICE")),
+                        "pb": _num(it.get("PB_MRQ")),
+                        "ps": _num(it.get("PS_TTM")),
+                        "pcf": _num(it.get("PCF_OCF_TTM"))})
         if len(out) >= total:
             break
         page += 1
@@ -642,6 +720,142 @@ def init_all_stock_pe(start_date: Optional[str] = None,
             "newly_done": len(todo) - len(failed),
             "failed": len(failed),
             "coverage": store.pe_coverage(start)}
+
+
+def init_all_stock_valuation(on_progress=None, cancel=None) -> dict:
+    """
+    估值重初始化：把存量 stock_pe 里缺 PB/PS/PCF 列的老数据重拉补齐。
+
+    背景：一期之前入库的历史估值只有 PE/市值/收盘价，PB_MRQ / PS_TTM / PCF
+    是一期起才一并采集的。老数据靠本任务一次性升级（UPSERT 只补缺列，不覆盖）。
+
+    判定与续传：store.pb_pending 找出「有数据但 pb 为 NULL」的代码，
+    逐只全历史重拉（force=True 绕过水位判断）；拉完一只就少一只，
+    中断后重跑自动从断点继续。全市场约 5500 只、单只 2~3 页请求，
+    限流下整体约 1.5~2 小时。on_progress(done, total, label)
+    """
+    prog = on_progress or (lambda *a: None)
+
+    prog(0, 0, "取全市场代码清单…")
+    codes = all_market_codes()
+    if not codes:
+        raise RuntimeError("取不到全市场股票代码清单，请检查网络后重试")
+
+    todo = store.pb_pending(codes)
+    total = len(codes)
+    done0 = total - len(todo)
+    failed: List[str] = []
+    for i, c in enumerate(todo, 1):
+        if cancel and cancel():
+            break
+        prog(done0 + i - 1, total, f"重拉 {c} 的历史估值 PB/PS（{done0 + i}/{total}）")
+        try:
+            fetch_stock_pe(c, PE_HISTORY_EARLIEST, force=True)
+        except Exception:                           # noqa: BLE001
+            failed.append(c)
+    prog(total, total, "完成")
+    return {"total": total, "todo": len(todo),
+            "newly_done": len(todo) - len(failed),
+            "failed": len(failed)}
+
+
+# --------------------------------------------------------------------------- #
+#  个股历史分红（股息率的数据源）
+# --------------------------------------------------------------------------- #
+# 东财估值库（PE/PB/PS 的来源）没有股息率列，历史股息率只能从分红明细反推：
+# 个股某日股息率 = 近 12 个月累计每股现金分红 ÷ 当日股价。分红明细来自
+# RPT_SHAREBONUS_DET，只取「已实施、除息日非空」的记录；每 10 股派息金额
+# 从方案描述 IMPL_PLAN_PROFILE（如 "10派2.332元(含税,扣税后2.0988元)"）解析。
+_DPS_RE = re.compile(r"派\s*([\d.]+)\s*元")
+
+
+def _parse_dps(plan: str) -> Optional[float]:
+    """从分红方案描述解析每 10 股派息（元），无现金分红返回 None"""
+    if not plan:
+        return None
+    m = _DPS_RE.search(plan)
+    if not m:
+        return None
+    try:
+        return float(m.group(1)) / 10.0
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_stock_div(code: str) -> List[dict]:
+    """
+    单只 A 股的历次现金分红，返回 [{code, ex_date, dps, report_date, plan}]。
+
+    dps = 每股派息（元）。历史分红是既成事实，成功入库后不再重下；
+    从未分红的股票接口返回空，但仍记水位（div_fetch_log），避免每次重拉。
+    """
+    out: List[dict] = []
+    page = 1
+    while page <= 10:
+        params = {
+            "reportName": "RPT_SHAREBONUS_DET", "columns": "ALL",
+            "pageNumber": str(page), "pageSize": "500",
+            "filter": f'(SECURITY_CODE="{code}")',
+            "sortColumns": "EX_DIVIDEND_DATE", "sortTypes": "1",
+            "source": "WEB", "client": "WEB",
+        }
+        url = "https://datacenter-web.eastmoney.com/api/data/v1/get?" + urllib.parse.urlencode(params)
+        res = (_jsonp_or_json(http_get(url, timeout=40)).get("result") or {})
+        data = res.get("data") or []
+        if not data:
+            break
+        for it in data:
+            ex = (it.get("EX_DIVIDEND_DATE") or "")[:10]
+            if not ex:
+                continue                        # 预案/未实施：除息日为空，不能算进 TTM
+            plan = it.get("IMPL_PLAN_PROFILE") or ""
+            dps = _parse_dps(plan)
+            if dps is None or dps <= 0:
+                continue                        # 纯送/转增，无现金分红
+            out.append({"code": code, "ex_date": ex, "dps": dps,
+                        "report_date": (it.get("REPORT_DATE") or "")[:10],
+                        "plan": plan})
+        if len(data) < 500:
+            break
+        page += 1
+    if out:
+        store.save_stock_div(out)
+    store.set_div_fetch_log(code)
+    return out
+
+
+def init_all_stock_div(on_progress=None, cancel=None) -> dict:
+    """
+    初始化：把全市场 A 股（估值库快照日清单）的历次现金分红拉进 stock_div。
+
+    完成后任意 ETF 的历史股息率回填都不再回源拉分红；单只失败不影响整体，
+    中断后重跑自动续传（div_fetch_log 水位）。约 5500 只 × 1 次请求/只，
+    限流 ~9 req/s 下整体约 10~20 分钟。on_progress(done, total, label)
+    """
+    prog = on_progress or (lambda *a: None)
+
+    prog(0, 0, "取全市场代码清单…")
+    codes = all_market_codes()
+    if not codes:
+        raise RuntimeError("取不到全市场股票代码清单，请检查网络后重试")
+
+    todo = store.div_pending(codes)
+    total = len(codes)
+    done0 = total - len(todo)
+    failed: List[str] = []
+    for i, c in enumerate(todo, 1):
+        if cancel and cancel():
+            break
+        prog(done0 + i - 1, total, f"拉取 {c} 的分红历史（{done0 + i}/{total}）")
+        try:
+            fetch_stock_div(c)
+        except Exception:                           # noqa: BLE001
+            failed.append(c)                        # 单只失败不影响整体，下次重跑会补
+    prog(total, total, "完成")
+    return {"total": total, "todo": len(todo),
+            "newly_done": len(todo) - len(failed),
+            "failed": len(failed),
+            "coverage": store.div_coverage()}
 
 
 def _fetch_holdings_upstream(etf_code: str) -> dict:
