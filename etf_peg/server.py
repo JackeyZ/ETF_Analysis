@@ -9,12 +9,14 @@ import time
 import traceback
 import urllib.parse
 from dataclasses import asdict
+from datetime import date
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List
 
 from . import datasource as ds
 from . import hk
 from . import peg
+from . import reports
 from . import store
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
@@ -39,7 +41,7 @@ def _eligible_etfs(limit: int) -> List[dict]:
     return out[:limit]
 
 
-def _scan_worker(limit: int, mode: str) -> None:
+def _scan_worker(limit: int, mode: str, pe_mode: str = "mixed") -> None:
     def cancelled() -> bool:
         with _SCAN_LOCK:
             return bool(_SCAN["cancel"])
@@ -67,7 +69,8 @@ def _scan_worker(limit: int, mode: str) -> None:
         results = peg.analyze_many(etfs, mode,
                                    on_progress=progress,
                                    on_stage=stage,
-                                   cancel=cancelled)
+                                   cancel=cancelled,
+                                   pe_mode=pe_mode)
         # analyze_many 被取消时会提前返回空列表，这里统一走取消分支，
         # 避免界面显示成「完成」却没有结果
         if cancelled():
@@ -164,6 +167,23 @@ def _job_worker(kind: str, **kw) -> None:
             result = peg.batch_backfill_rank(top=int(kw.get("top", 160)),
                                              on_progress=prog_count,
                                              cancel=cancelled)
+        elif kind == "reports":
+            # 研报按「年段」翻页，单段进度会反复归零，这里换算成跨年度的总进度
+            years_total = max(1, date.today().year - reports._EARLIEST + 1)
+            seg_no: Dict[str, int] = {}
+
+            def prog_reports(seg, done, total, new):
+                if seg not in seg_no:
+                    seg_no[seg] = len(seg_no) + 1
+                base = (seg_no[seg] - 1) / years_total * 100
+                step = (done / total * 100 / years_total) if total else 0
+                with _JOB_LOCK:
+                    _JOB["pct"] = round(min(99.9, base + step), 1)
+                    _JOB["stage"] = f"{seg} 年 {done}/{total} 页 · 新增 {new} 篇"
+                    _JOB["done"], _JOB["total"] = done, total
+
+            result = reports.sync(force=bool(kw.get("force")),
+                                  on_progress=prog_reports)
         else:
             raise ValueError(f"未知任务类型：{kind}")
 
@@ -185,21 +205,34 @@ def _job_worker(kind: str, **kw) -> None:
 
 def _auto_backfill_history(code: str) -> None:
     """
-    分析后自动补齐该 ETF 的历史月度估值（PE/PB/PS 逐日序列与历史分位）。
+    分析后自动补齐该 ETF 的历史估值序列（PE/PB/PS 逐日快照与历史分位）。
 
-    现状：etf_daily 只有在分析时 record 当天一条快照，不「回填」的话，
-    历史月度估值永远只有 1 个月，PB/PS 历史分位也算不出来。这里在历史
-    明显缺失（不足约 3 个月交易日）时，用后台线程异步回填一次全历史——
-    纯 A 股 ETF 约 30 秒，含港股的 ETF 要几分钟，同步做会卡死 analyze 响应。
-    已算满的直接走 backfill_etf 增量判断秒回；失败静默降级，不影响本次分析。
+    回填本身是增量判定（已算过的日期秒回），满足任一条件即触发：
+    - 历史缺失或不足约 3 个月交易日 —— 首次全量回填；
+    - 股息率列尚未补算 —— 老库升级的一次性补算；
+    - 历史最新日期落后最近交易日超过 3 个自然日 —— 每次分析自动把历史补到最新。
+      港股历史尤其靠这一步推进：中间的空档（工具没开的那几天）由
+      backfill_etf 的 detect_kline_gaps 逐只补拉。
 
-    股息率（div_calc）同理：老库已有 PE/PB/PS 历史但缺股息率列时，也触发
-    一次补算（backfill_etf 的增量判定只重算 div_calc=0 的日期）。
+    失败静默降级，不影响本次分析。
     """
     try:
-        hist = store.get_history(code, 99999)
-        if len(hist) >= 60 and all(r.get("div_calc") for r in hist):
-            return
+        # v10：两套口径各自检查（fixed 为主，pit 也需补齐）
+        hist_fixed = store.get_history(code, 99999, "fixed")
+        hist_pit = store.get_history(code, 99999, "pit")
+        version_old = (store.get_calc_version(code, "fixed") < peg.CALC_VERSION
+                       or store.get_calc_version(code, "pit") < peg.CALC_VERSION)
+        need = (not hist_fixed or len(hist_fixed) < 60
+                or not hist_pit
+                or not all(r.get("div_calc") for r in hist_fixed)
+                or not all(r.get("div_calc") for r in hist_pit)
+                or version_old)
+        if not need:
+            # 历史完整且股息率已补：仅当落后最近交易日超过 3 个自然日才增量回填
+            latest = hist_fixed[0]["date"]             # get_history 降序，hist[0] 最新
+            y, m, d = (int(x) for x in latest.split("-"))
+            if (date.today() - date(y, m, d)).days < 3:
+                return
     except Exception:                                   # noqa: BLE001
         return
     with _AUTOBF_LOCK:
@@ -209,8 +242,16 @@ def _auto_backfill_history(code: str) -> None:
 
     def worker() -> None:
         try:
-            # 全历史（个股每日 PE 上游最早 2018-01-02，约 8.6 年）
-            peg.backfill_etf(code, days=3650)
+            # 先补齐最近 35 天缺失的全市场 PE：工具没开的日子会留下空档，
+            # 导致「最近一月逐日」缺天（只有 10 来天）。只在缺天时回源。
+            try:
+                ds.backfill_recent_market_pe(35)
+            except Exception:                       # noqa: BLE001
+                pass
+            # 全历史（个股每日 PE 上游最早 2018-01-02，约 8.6 年）。
+            # 口径版本落后时必须 force：backfill_etf 的增量判定只看「日期在不在
+            # 库里」，不 force 会直接判定"已算满"返回，新增列永远补不出来。
+            peg.backfill_etf(code, days=3650, force=version_old)
         except Exception as exc:                       # noqa: BLE001
             with _AUTOBF_LOCK:
                 _AUTOBF["error"] = f"{type(exc).__name__}: {exc}"
@@ -311,6 +352,9 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/analyze":
                 code = (qs.get("code") or [""])[0].strip()
                 mode = (qs.get("mode") or ["ttm"])[0]
+                # 财报口径：mixed（各股用自己最新已披露期）| uniform（全组合同一期）
+                pe_mode = "uniform" if (qs.get("pemode") or ["mixed"])[0] == "uniform" \
+                    else "mixed"
                 if not code:
                     return self._fail("缺少 code 参数", 400)
                 # 名称先查全市场基金（含场外），再退回 ETF 列表；
@@ -319,11 +363,72 @@ class Handler(SimpleHTTPRequestHandler):
                 name = (f or {}).get("name") or code
                 # 行情与财报由 analyze_etf 内部按需载入（各自带缓存 / 本地库），
                 # 不要在这里预拉，否则会多下载一倍用不到的报告期
-                r = peg.analyze_etf(code, name, mode, series_quarters=20)
+                r = peg.analyze_etf(code, name, mode, series_quarters=20,
+                                    pe_mode=pe_mode)
                 # 历史缺失时自动回填，让「历史月度估值 / PB·PS 历史分位」完整
                 # （首次约 30~60 秒，之后命中增量判断秒回；失败静默降级）
                 _auto_backfill_history(code)
-                return self._json({"ok": True, "data": asdict(r)})
+                d = asdict(r)
+                # 场外基金（非场内 ETF 代码）：按最新持仓成分股当日涨跌加权，估算当天涨跌
+                if not code.startswith(("51", "56", "58", "15")):
+                    d["est_pct"] = peg.estimate_day_pct(r.stocks)
+                    # 场内 ETF 的规模来自 clist 名录；场外基金不在名录里，
+                    # 从基金档案补（A/C 份额各自独立，如 013816=2.37 亿 / 013817=5.02 亿）
+                    if d.get("market_cap") is None:
+                        try:
+                            d["market_cap"] = ds.fetch_fund_scale(code)
+                        except Exception:               # noqa: BLE001
+                            pass
+                return self._json({"ok": True, "data": d})
+
+            if path == "/api/stock/forecast/refresh":
+                # 弹窗打开后异步调用：查上游有没有新研报，有就增量拉回来
+                code = (qs.get("code") or [""])[0].strip()
+                if not code:
+                    return self._fail("缺少 code 参数", 400)
+                try:
+                    return self._json({"ok": True,
+                                       "data": reports.refresh_stock(code)})
+                except Exception as exc:                       # noqa: BLE001
+                    return self._json({"ok": False, "error": str(exc)})
+
+            if path == "/api/stock/forecast/panel":
+                # 逐机构预测明细（「复制给 AI」用，不做聚合）
+                raw = (qs.get("codes") or [""])[0]
+                codes = [c.strip() for c in raw.split(",") if c.strip()]
+                if not codes:
+                    return self._fail("缺少 codes 参数", 400)
+                n = int((qs.get("n") or [4])[0])            # 每家机构保留几篇
+                m = int((qs.get("months") or [36])[0])      # 时间窗口（月）
+                try:
+                    return self._json({"ok": True,
+                                       "data": reports.forecast_panel(
+                                           codes, per_org=n, months=m)})
+                except Exception as exc:                       # noqa: BLE001
+                    return self._json({"ok": False, "error": str(exc)})
+
+            if path == "/api/stock/forecast/batch":
+                # 多只股票的预测摘要（「复制给 AI」的报告里一次取前二十大）
+                raw = (qs.get("codes") or [""])[0]
+                codes = [c.strip() for c in raw.split(",") if c.strip()]
+                if not codes:
+                    return self._fail("缺少 codes 参数", 400)
+                try:
+                    return self._json({"ok": True,
+                                       "data": reports.batch_forecast(codes)})
+                except Exception as exc:                       # noqa: BLE001
+                    return self._json({"ok": False, "error": str(exc)})
+
+            if path == "/api/stock/forecast":
+                # 单只股票的历史分析师预测（点击成分股弹窗用）
+                code = (qs.get("code") or [""])[0].strip()
+                if not code:
+                    return self._fail("缺少 code 参数", 400)
+                try:
+                    return self._json({"ok": True,
+                                       "data": reports.stock_forecast(code)})
+                except Exception as exc:                       # noqa: BLE001
+                    return self._json({"ok": False, "error": str(exc)})
 
             if path == "/api/scan/start":
                 # 关键：这里必须立即返回。以前在此处同步拉 ETF 列表，
@@ -336,7 +441,9 @@ class Handler(SimpleHTTPRequestHandler):
                                  started_at=time.time())
                 limit = int((qs.get("limit") or [60])[0])
                 mode = (qs.get("mode") or ["ttm"])[0]
-                threading.Thread(target=_scan_worker, args=(limit, mode),
+                pe_mode = "uniform" if (qs.get("pemode") or ["mixed"])[0] == "uniform" \
+                    else "mixed"
+                threading.Thread(target=_scan_worker, args=(limit, mode, pe_mode),
                                  daemon=True).start()
                 return self._json({"ok": True, "msg": "已启动"})
 
@@ -382,6 +489,8 @@ class Handler(SimpleHTTPRequestHandler):
                     kw = {"code": code, "days": days, "force": force}
                 elif kind == "batchrank":
                     kw = {"top": int((qs.get("top") or [160])[0])}
+                elif kind == "reports":
+                    kw = {"force": (qs.get("force") or [""])[0] in ("1", "true", "yes")}
                 elif kind not in ("initpe", "inithk", "initvaluation", "initdiv"):
                     return self._fail("未知任务类型", 400)
 
@@ -444,7 +553,11 @@ class Handler(SimpleHTTPRequestHandler):
                 years = float((qs.get("years") or [0])[0])
                 days = int(years * 365) if years else int((qs.get("days") or [180])[0])
                 by = (qs.get("by") or ["day"])[0]
-                rows = store.get_history(code, days)
+                # v10：口径。fixed=最新持仓回溯（默认），pit=当时已知持仓
+                basis = (qs.get("basis") or ["fixed"])[0]
+                if basis not in ("fixed", "pit"):
+                    basis = "fixed"
+                rows = store.get_history(code, days, basis)
                 if by in ("year", "quarter", "month"):
                     return self._json({"ok": True, "data": peg.aggregate_history(rows, by),
                                        "by": by, "daily_days": len(rows)})
@@ -457,6 +570,23 @@ class Handler(SimpleHTTPRequestHandler):
                         "by_month": peg.aggregate_history(rows, "month"),
                     }})
                 return self._json({"ok": True, "data": rows, "by": "day"})
+
+            if path == "/api/kline":
+                # ETF/场外基金 历史股价/净值 K 线：按代码前缀分流
+                code = (qs.get("code") or [""])[0].strip()
+                if not code:
+                    return self._fail("缺少 code 参数", 400)
+                try:
+                    if code.startswith(("51", "56", "58", "15")):
+                        data = ds.fetch_etf_kline(code)
+                    else:
+                        data = ds.fetch_fund_nav(code)
+                    return self._json({"ok": True, "data": data})
+                except Exception as exc:                       # noqa: BLE001
+                    return self._json({"ok": False, "error": str(exc)})
+
+            if path == "/api/report-stats":
+                return self._json({"ok": True, "data": store.report_stats()})
 
             if path == "/api/meta":
                 periods = ds.latest_report_periods()

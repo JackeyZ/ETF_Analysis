@@ -115,6 +115,8 @@ class Store:
                 -- 港股财报类型（年报/中报/一季报/三季报）与财年截止（如 12-31/03-31），
                 -- 按公司财年构造 TTM 的依据；A 股源接口没有这两个字段，保持 NULL
                 report_type TEXT, fiscal_year TEXT,
+                -- 扣非归母净利润（元）：A 股来自利润表接口，港股无此概念保持 NULL
+                deduct_np REAL,
                 PRIMARY KEY (period, code)
             ) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS ix_fin_period ON fin(period);
@@ -199,9 +201,21 @@ class Store:
                 -- div_calc=1 表示该日股息率已按分红数据算过（纯成长股组合可能
                 -- 合法地为 NULL，不能用 div_yield 是否非空当完成标志）
                 div_calc INTEGER DEFAULT 0,
-                PRIMARY KEY (d, etf_code)
+                -- TTM 扣非归母净利润合计（元）。港股不披露扣非，该部分用归母顶上，
+                -- 与成分股表的 † 口径一致；与 np 用同一批样本（PE>0 且增速>0）
+                deduct_ttm REAL,
+                -- v9 起：归母净利合计（全口径加权，元）与扣非 PEG 三件套。
+                -- np_ttm 与 deduct_ttm 完全对称；g_deduct 只在 >0 时 deduct_peg 有值
+                np_ttm REAL,
+                deduct_pe REAL,
+                g_deduct REAL,
+                deduct_peg REAL,
+                -- v10：口径维度。fixed=最新持仓回溯（默认，柱子间可比），
+                -- pit=每期用当时已知持仓（无前视，但含调仓噪音）
+                basis TEXT NOT NULL DEFAULT 'pit',
+                PRIMARY KEY (d, etf_code, basis)
             ) WITHOUT ROWID;
-            CREATE INDEX IF NOT EXISTS ix_daily_etf ON etf_daily(etf_code, d);
+            CREATE INDEX IF NOT EXISTS ix_daily_etf ON etf_daily(etf_code, basis, d);
 
             -- 个股历史分红（每股派息，元）：除息日 + 派息额。既成事实，永久保存。
             CREATE TABLE IF NOT EXISTS stock_div (
@@ -215,15 +229,63 @@ class Store:
             CREATE TABLE IF NOT EXISTS div_fetch_log (
                 code TEXT PRIMARY KEY, requested_at TEXT
             );
+
+            -- 计算口径版本：PE/PEG 等算法不兼容变更时 +1；
+            -- 回填检测到该 ETF 版本落后会自动 force 重算全部历史。
+            -- v10：按 basis（fixed/pit）分开记录，两套序列独立增量
+            CREATE TABLE IF NOT EXISTS etf_calc_version (
+                etf_code TEXT NOT NULL, basis TEXT NOT NULL DEFAULT 'pit',
+                version INTEGER, updated_at TEXT,
+                PRIMARY KEY (etf_code, basis)
+            ) WITHOUT ROWID;
+
+            -- 券商研报的盈利预测（每篇一行，全历史）。
+            -- 与 cons_forecast（每家机构最新一版）互补：那张表只存当下，
+            -- 这张表存时序，才能算「某家机构上次说多少、这次说多少」。
+            -- year_1/2/3 是绝对财年：接口的「今年」随发布年漂移，
+            -- 不换算成绝对年份就做不了跨年对比。
+            CREATE TABLE IF NOT EXISTS report (
+                info_code TEXT PRIMARY KEY,
+                publish_date TEXT NOT NULL,
+                stock_code TEXT NOT NULL, stock_name TEXT,
+                org_code TEXT, org_name TEXT, researcher TEXT,
+                rating TEXT, last_rating TEXT, rating_change INTEGER,
+                target_price REAL,
+                eps_y1 REAL, year_1 INTEGER,
+                eps_y2 REAL, year_2 INTEGER,
+                eps_y3 REAL, year_3 INTEGER,
+                eps_last REAL,
+                industry TEXT, title TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ix_rpt_stock ON report(stock_code, publish_date);
+            CREATE INDEX IF NOT EXISTS ix_rpt_org ON report(stock_code, org_code, publish_date);
+            CREATE INDEX IF NOT EXISTS ix_rpt_date ON report(publish_date);
+
+            -- 研报同步水位：按「年」分段，记住哪一段已经拉过
+            CREATE TABLE IF NOT EXISTS report_sync (
+                seg TEXT PRIMARY KEY, rows INTEGER, fetched_at TEXT
+            );
             """)
             cols = {r[1] for r in c.execute("PRAGMA table_info(fin)")}
             if "notice_date" not in cols:
                 c.execute("ALTER TABLE fin ADD COLUMN notice_date TEXT")
+            # 上游入库时间戳（东财 EITIME）：盘后披露的财报公告日会记成次日，
+            # 用它与 notice_date 取较早者做 PIT，才不至于当晚仍用上一期报告
+            if "notice_ts" not in cols:
+                c.execute("ALTER TABLE fin ADD COLUMN notice_ts TEXT")
             # 估值扩展列：老库一次性补齐（历史行 NULL，由重拉增量填充）
             for _col in ("bps", "equity", "dividend_rate", "dps",
                          "total_liab", "end_cash", "op_profit"):
                 if _col not in cols:
                     c.execute(f"ALTER TABLE fin ADD COLUMN {_col} REAL")
+            _d_cols = {r[1] for r in c.execute("PRAGMA table_info(etf_daily)")}
+            if "deduct_ttm" not in _d_cols:
+                c.execute("ALTER TABLE etf_daily ADD COLUMN deduct_ttm REAL")
+            # v9：归母净利合计与扣非 PEG 三件套（老库补列，历史行 NULL，
+            # 由 CALC_VERSION 升版后的强制重算补齐）
+            for _col in ("np_ttm", "deduct_pe", "g_deduct", "deduct_peg"):
+                if _col not in _d_cols:
+                    c.execute(f"ALTER TABLE etf_daily ADD COLUMN {_col} REAL")
             _pe_cols = {r[1] for r in c.execute("PRAGMA table_info(stock_pe)")}
             for _col in ("pb", "ps", "pcf"):
                 if _col not in _pe_cols:
@@ -237,6 +299,43 @@ class Store:
                     c.execute(f"ALTER TABLE etf_daily ADD COLUMN {_col} REAL")
             if "div_calc" not in _ed_cols:
                 c.execute("ALTER TABLE etf_daily ADD COLUMN div_calc INTEGER DEFAULT 0")
+            # v10：etf_daily 主键加 basis（WITHOUT ROWID 不能改主键，只能重建）。
+            # 老数据全部迁为 basis='pit'（它们本来就是 PIT 口径算出来的）。
+            _ed_cols = {r[1] for r in c.execute("PRAGMA table_info(etf_daily)")}
+            if _ed_cols and "basis" not in _ed_cols:
+                c.execute("""CREATE TABLE etf_daily_v10 (
+                    d TEXT NOT NULL, etf_code TEXT NOT NULL, name TEXT,
+                    pe REAL, g_ttm REAL, g_all REAL, peg REAL, coverage REAL,
+                    n_valid INTEGER, n_total INTEGER, report_date TEXT,
+                    pb REAL, ps REAL, div_yield REAL,
+                    pe_pct REAL, pb_pct REAL, ps_pct REAL,
+                    div_calc INTEGER DEFAULT 0, deduct_ttm REAL,
+                    np_ttm REAL, deduct_pe REAL, g_deduct REAL, deduct_peg REAL,
+                    basis TEXT NOT NULL DEFAULT 'pit',
+                    PRIMARY KEY (d, etf_code, basis)
+                ) WITHOUT ROWID""")
+                c.execute("""INSERT INTO etf_daily_v10
+                    SELECT d, etf_code, name, pe, g_ttm, g_all, peg, coverage,
+                           n_valid, n_total, report_date, pb, ps, div_yield,
+                           pe_pct, pb_pct, ps_pct, div_calc, deduct_ttm,
+                           np_ttm, deduct_pe, g_deduct, deduct_peg, 'pit'
+                    FROM etf_daily""")
+                c.execute("DROP TABLE etf_daily")
+                c.execute("ALTER TABLE etf_daily_v10 RENAME TO etf_daily")
+                c.execute("CREATE INDEX IF NOT EXISTS ix_daily_etf "
+                          "ON etf_daily(etf_code, basis, d)")
+            # v10：口径版本也按 basis 拆分（两套序列独立增量）
+            _cv_cols = {r[1] for r in c.execute("PRAGMA table_info(etf_calc_version)")}
+            if _cv_cols and "basis" not in _cv_cols:
+                c.execute("""CREATE TABLE etf_calc_version_v10 (
+                    etf_code TEXT NOT NULL, basis TEXT NOT NULL DEFAULT 'pit',
+                    version INTEGER, updated_at TEXT,
+                    PRIMARY KEY (etf_code, basis)
+                ) WITHOUT ROWID""")
+                c.execute("""INSERT INTO etf_calc_version_v10
+                    SELECT etf_code, 'pit', version, updated_at FROM etf_calc_version""")
+                c.execute("DROP TABLE etf_calc_version")
+                c.execute("ALTER TABLE etf_calc_version_v10 RENAME TO etf_calc_version")
             # 港股：PE 要求市值与净利同币种，股本用于按报告期还原历史市值
             if "currency" not in cols:
                 c.execute("ALTER TABLE fin ADD COLUMN currency TEXT")
@@ -247,6 +346,9 @@ class Store:
                 c.execute("ALTER TABLE fin ADD COLUMN report_type TEXT")
             if "fiscal_year" not in cols:
                 c.execute("ALTER TABLE fin ADD COLUMN fiscal_year TEXT")
+            # 扣非归母净利润（v4：成分股明细要展示 TTM 扣非及其上年同期）
+            if "deduct_np" not in cols:
+                c.execute("ALTER TABLE fin ADD COLUMN deduct_np REAL")
             if "market" not in {r[1] for r in c.execute("PRAGMA table_info(holding)")}:
                 c.execute("ALTER TABLE holding ADD COLUMN market TEXT")
             c.execute("DROP TABLE IF EXISTS _mkt_placeholder")
@@ -275,19 +377,20 @@ class Store:
             except Exception:                            # noqa: BLE001
                 return None
         out: Dict[str, dict] = {}
-        for code, name, pnp, yoy, rev, ryoy, eps, roe, rd, nd, cur, sh, \
-                bps, eq, divr, dps, tliab, cash, op, rt, fy in c.execute(
+        for code, name, pnp, yoy, rev, ryoy, eps, roe, rd, nd, nts, cur, sh, \
+                bps, eq, divr, dps, tliab, cash, op, rt, fy, dnp in c.execute(
                 "SELECT code,name,parent_np,np_yoy,revenue,rev_yoy,eps,roe,report_date,"
-                "notice_date,currency,shares,"
+                "notice_date,notice_ts,currency,shares,"
                 "bps,equity,dividend_rate,dps,total_liab,end_cash,op_profit,"
-                "report_type,fiscal_year "
+                "report_type,fiscal_year,deduct_np "
                 "FROM fin WHERE period=?", (period,)):
             out[code] = {"name": name, "parent_np": pnp, "np_yoy": yoy, "revenue": rev,
                          "rev_yoy": ryoy, "eps": eps, "roe": roe, "report_date": rd,
-                         "notice_date": nd, "currency": cur, "shares": sh,
+                         "notice_date": nd, "notice_ts": nts,
+                         "currency": cur, "shares": sh,
                          "bps": bps, "equity": eq, "dividend_rate": divr, "dps": dps,
                          "total_liab": tliab, "end_cash": cash, "op_profit": op,
-                         "report_type": rt, "fiscal_year": fy}
+                         "report_type": rt, "fiscal_year": fy, "deduct_np": dnp}
         return out if len(out) >= max(1, (n or 0) // 2) else None
 
     def fin_has_notice(self, period: str) -> bool:
@@ -295,6 +398,14 @@ class Store:
         self.init()
         row = self._conn().execute(
             "SELECT COUNT(*) FROM fin WHERE period=? AND notice_date IS NOT NULL",
+            (period,)).fetchone()
+        return bool(row and row[0] > 0)
+
+    def fin_has_notice_ts(self, period: str) -> bool:
+        """该期是否已存上游入库时间戳（PIT 用它修正盘后披露的次日公告日）"""
+        self.init()
+        row = self._conn().execute(
+            "SELECT COUNT(*) FROM fin WHERE period=? AND notice_ts IS NOT NULL",
             (period,)).fetchone()
         return bool(row and row[0] > 0)
 
@@ -315,17 +426,17 @@ class Store:
         for i in range(0, len(codes), B):
             chunk = codes[i:i + B]
             ph = ",".join("?" * len(chunk))
-            for code, pnp, yoy, nd, cur, sh, rev, bps, eq, divr, dps, tliab, cash, op, eps, roe \
+            for code, pnp, yoy, nd, cur, sh, rev, bps, eq, divr, dps, tliab, cash, op, eps, roe, dnp \
                     in self._conn().execute(
                     f"SELECT code,parent_np,np_yoy,notice_date,currency,shares,"
                     f"revenue,bps,equity,dividend_rate,dps,total_liab,end_cash,op_profit,"
-                    f"eps,roe "
+                    f"eps,roe,deduct_np "
                     f"FROM fin WHERE period=? AND code IN ({ph})", (period, *chunk)):
                 out[code] = {"parent_np": pnp, "np_yoy": yoy, "notice_date": nd,
                              "currency": cur, "shares": sh, "revenue": rev,
                              "bps": bps, "equity": eq, "dividend_rate": divr, "dps": dps,
                              "total_liab": tliab, "end_cash": cash, "op_profit": op,
-                             "eps": eps, "roe": roe}
+                             "eps": eps, "roe": roe, "deduct_np": dnp}
         return out
 
     def fin_shares(self, code: str) -> List[Tuple[str, float]]:
@@ -348,17 +459,17 @@ class Store:
             c.execute("DELETE FROM fin WHERE period=?", (period,))
             c.executemany(
                 "INSERT OR REPLACE INTO fin (period,code,name,parent_np,np_yoy,revenue,"
-                "rev_yoy,eps,roe,report_date,notice_date,currency,shares,"
+                "rev_yoy,eps,roe,report_date,notice_date,notice_ts,currency,shares,"
                 "bps,equity,dividend_rate,dps,total_liab,end_cash,op_profit,"
-                "report_type,fiscal_year) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "report_type,fiscal_year,deduct_np) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [(period, code, v.get("name"), v.get("parent_np"), v.get("np_yoy"),
                   v.get("revenue"), v.get("rev_yoy"), v.get("eps"), v.get("roe"),
-                  v.get("report_date"), v.get("notice_date"),
+                  v.get("report_date"), v.get("notice_date"), v.get("notice_ts"),
                   v.get("currency"), v.get("shares"),
                   v.get("bps"), v.get("equity"), v.get("dividend_rate"), v.get("dps"),
                   v.get("total_liab"), v.get("end_cash"), v.get("op_profit"),
-                  v.get("report_type"), v.get("fiscal_year"))
+                  v.get("report_type"), v.get("fiscal_year"), v.get("deduct_np"))
                  for code, v in data.items()])
             c.execute("INSERT OR REPLACE INTO fin_period VALUES (?,?,?,?,1)",
                       (period, len(data), 1 if settled else 0, _now()))
@@ -381,6 +492,34 @@ class Store:
             (period,)).fetchone()
         return bool(row and row[0] > 0)
 
+    def fin_has_deduct(self, period: str) -> bool:
+        """该期是否已存有扣非归母净利润。
+
+        扣非来自另一张报表接口（利润表 RPT_DMSK_FN_INCOME），与主财报分开拉取：
+        老库的 fin 行里该列为 NULL，命中缓存时要靠它判断是否需要补拉一次。
+        """
+        self.init()
+        row = self._conn().execute(
+            "SELECT COUNT(*) FROM fin WHERE period=? AND deduct_np IS NOT NULL",
+            (period,)).fetchone()
+        return bool(row and row[0] > 0)
+
+    def save_deduct(self, period: str, data: Dict[str, Optional[float]]) -> int:
+        """把扣非归母净利润回填进已入库的 fin 行（只 UPDATE 这一列）。
+
+        返回实际更新的行数。fin 行不存在时 UPDATE 自然不生效，
+        所以调用方要先 save_fin 再 save_deduct。
+        """
+        self.init()
+        rows = [(v, period, code) for code, v in data.items() if v is not None]
+        if not rows:
+            return 0
+        with _WRITE_LOCK:
+            c = self._conn()
+            c.executemany("UPDATE fin SET deduct_np=? WHERE period=? AND code=?", rows)
+            c.commit()
+        return len(rows)
+
     def load_fin_rows(self, codes: List[str]) -> Dict[str, List[dict]]:
         """
         按公司读取其全部报告期的财报行（升序），供港股按公司财年构造 TTM。
@@ -398,15 +537,16 @@ class Store:
         for i in range(0, len(codes), B):
             chunk = codes[i:i + B]
             ph = ",".join("?" * len(chunk))
-            for code, period, pnp, rev, op, rt, fy, yoy, dps, eq, rd in \
+            for code, period, pnp, rev, op, rt, fy, yoy, dps, eq, rd, dnp in \
                     self._conn().execute(
                     f"SELECT code, period, parent_np, revenue, op_profit, report_type, "
-                    f"fiscal_year, np_yoy, dps, equity, report_date FROM fin "
+                    f"fiscal_year, np_yoy, dps, equity, report_date, deduct_np FROM fin "
                     f"WHERE code IN ({ph}) ORDER BY code, period", chunk):
                 out[code].append({
                     "period": period, "parent_np": pnp, "revenue": rev,
                     "op_profit": op, "report_type": rt, "fiscal_year": fy,
                     "np_yoy": yoy, "dps": dps, "equity": eq, "report_date": rd,
+                    "deduct_np": dnp,
                 })
         return out
 
@@ -468,6 +608,78 @@ class Store:
                 [(code, y, v.get("mark"), v.get("np"), v.get("np_ratio"),
                   v.get("eps"), v.get("pe"), n_org, _now())
                  for y, v in years.items()])
+            c.commit()
+
+    # ------------------------------------------------------------------ #
+    #  券商研报盈利预测（全历史，item = 一篇研报）
+    # ------------------------------------------------------------------ #
+    _REPORT_COLS = ("info_code", "publish_date", "stock_code", "stock_name",
+                    "org_code", "org_name", "researcher", "rating", "last_rating",
+                    "rating_change", "target_price", "eps_y1", "year_1",
+                    "eps_y2", "year_2", "eps_y3", "year_3", "eps_last",
+                    "industry", "title")
+
+    def save_reports(self, rows: List[dict]) -> int:
+        """批量写入研报预测，返回真正新增的条数（info_code 已存在则忽略）。"""
+        self.init()
+        if not rows:
+            return 0
+        cols = self._REPORT_COLS
+        sql = ("INSERT OR IGNORE INTO report (" + ",".join(cols) + ") VALUES ("
+               + ",".join("?" * len(cols)) + ")")
+        with _WRITE_LOCK:
+            c = self._conn()
+            before = c.total_changes
+            c.executemany(sql, [tuple(r.get(k) for k in cols) for r in rows])
+            c.commit()
+            return c.total_changes - before
+
+    def load_stock_reports(self, code: str) -> List[dict]:
+        """该股全部研报，按发布日升序（同日按 info_code 稳定排序）。"""
+        self.init()
+        out: List[dict] = []
+        for r in self._conn().execute(
+                "SELECT info_code, publish_date, org_code, org_name, researcher, "
+                "rating, last_rating, rating_change, target_price, "
+                "eps_y1, year_1, eps_y2, year_2, eps_y3, year_3, eps_last, "
+                "stock_name, industry, title "
+                "FROM report WHERE stock_code=? ORDER BY publish_date, info_code", (code,)):
+            out.append({
+                "info_code": r[0], "publish_date": r[1], "org_code": r[2],
+                "org_name": r[3], "researcher": r[4], "rating": r[5],
+                "last_rating": r[6], "rating_change": r[7], "target_price": r[8],
+                "eps_y1": r[9], "year_1": r[10], "eps_y2": r[11], "year_2": r[12],
+                "eps_y3": r[13], "year_3": r[14], "eps_last": r[15],
+                "stock_name": r[16], "industry": r[17], "title": r[18],
+            })
+        return out
+
+    def stock_latest_report_date(self, code: str) -> Optional[str]:
+        """该股已入库研报的最新发布日；没有则 None（弹窗据此决定增量起点）。"""
+        self.init()
+        row = self._conn().execute(
+            "SELECT MAX(publish_date) FROM report WHERE stock_code=?", (code,)).fetchone()
+        return row[0] if row and row[0] else None
+
+    def report_stats(self) -> dict:
+        self.init()
+        row = self._conn().execute(
+            "SELECT COUNT(*), COUNT(DISTINCT stock_code), "
+            "MIN(publish_date), MAX(publish_date) FROM report").fetchone()
+        return {"rows": row[0] or 0, "stocks": row[1] or 0,
+                "start": row[2], "end": row[3]}
+
+    def report_seg_done(self, seg: str) -> bool:
+        self.init()
+        return bool(self._conn().execute(
+            "SELECT 1 FROM report_sync WHERE seg=?", (seg,)).fetchone())
+
+    def report_seg_save(self, seg: str, n: int) -> None:
+        self.init()
+        with _WRITE_LOCK:
+            c = self._conn()
+            c.execute("INSERT OR REPLACE INTO report_sync VALUES (?,?,?)",
+                      (seg, n, _now()))
             c.commit()
 
     # ------------------------------------------------------------------ #
@@ -655,18 +867,19 @@ class Store:
         """
         把 stock_pe 里新出现的交易日补进日历表。
 
-        只补「比日历最大日期更新」的部分：日常就是几条，
-        只有建表后第一次会全表扫一遍（约 1.6s，一次性）。
+        之前只补「比日历最大日期更新」的部分，会漏掉「中间残缺日」：
+        某天快照因限流只写入部分股票，后补拉 K 线才补齐的那天，日期小于
+        日历最大日期，永远进不了日历 → detect_kline_gaps 的「应有交易日数」
+        被低估，真实空洞检测不出来（如港股 10-13/14/15 残缺却查不出）。
+        改为补「最近 90 天内所有缺失日期」：扫描范围小、有索引，毫秒级。
         """
         self.init()
+        since = (date.today() - timedelta(days=90)).isoformat()
         with _WRITE_LOCK:
             c = self._conn()
-            row = c.execute("SELECT COALESCE(MAX(trade_date), '') "
-                            "FROM trade_calendar").fetchone()
-            since = row[0] if row else ""
-            cur = c.execute(
+            c.execute(
                 "INSERT OR IGNORE INTO trade_calendar(trade_date) "
-                "SELECT DISTINCT trade_date FROM stock_pe WHERE trade_date > ?",
+                "SELECT DISTINCT trade_date FROM stock_pe WHERE trade_date >= ?",
                 (since,))
             # 必须无条件 commit：Python 3.12+ 的 sqlite3 默认 isolation_level=""
             # 是「隐式事务」，DML 语句执行时自动 BEGIN，不 commit 则写锁不释放。
@@ -832,7 +1045,7 @@ class Store:
     def record_daily(self, rows: List[dict], d: Optional[str] = None) -> None:
         """
         写入每日快照。行内带 date 字段时按该日期写（历史回填用），
-        否则统一用 d / 今天（日常分析用）。
+        否则统一用 d / 今天（日常分析用）；basis 缺省为 fixed（主口径）。
         """
         self.init()
         default_d = d or time.strftime("%Y-%m-%d")
@@ -841,41 +1054,76 @@ class Store:
             c.executemany(
                 "INSERT OR REPLACE INTO etf_daily (d, etf_code, name, pe, g_ttm, g_all, "
                 "peg, coverage, n_valid, n_total, report_date, pb, ps, div_yield, "
-                "pe_pct, pb_pct, ps_pct, div_calc) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "pe_pct, pb_pct, ps_pct, div_calc, deduct_ttm, "
+                "np_ttm, deduct_pe, g_deduct, deduct_peg, basis) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [(r.get("date") or default_d, r.get("code"), r.get("name"), r.get("pe"),
                   r.get("g_ttm"), r.get("g_all"), r.get("peg"), r.get("coverage"),
                   r.get("n_valid"), r.get("n_total"), r.get("report_date"),
                   r.get("pb"), r.get("ps"), r.get("div_yield"),
                   r.get("pe_pct"), r.get("pb_pct"), r.get("ps_pct"),
-                  r.get("div_calc", 0))
+                  r.get("div_calc", 0), r.get("deduct_ttm_sum"),
+                  r.get("np_ttm"), r.get("deduct_pe"), r.get("g_deduct"),
+                  r.get("deduct_peg"), r.get("basis") or "fixed")
                  for r in rows if r.get("code")])
             c.commit()
 
-    def clear_daily(self, etf_code: Optional[str] = None) -> int:
-        """清空每日快照（口径变更时用）；不传代码则清空全部。"""
+    def clear_daily(self, etf_code: Optional[str] = None,
+                    basis: Optional[str] = None) -> int:
+        """清空每日快照（口径变更时用）；不传代码/basis 则清空全部。"""
         self.init()
         with _WRITE_LOCK:
             c = self._conn()
+            where, args = [], []
             if etf_code:
-                c.execute("DELETE FROM etf_daily WHERE etf_code=?", (etf_code,))
-            else:
-                c.execute("DELETE FROM etf_daily")
+                where.append("etf_code=?")
+                args.append(etf_code)
+            if basis:
+                where.append("basis=?")
+                args.append(basis)
+            sql = "DELETE FROM etf_daily" + (" WHERE " + " AND ".join(where) if where else "")
+            c.execute(sql, args)
             n = c.total_changes
             c.commit()
         return n
 
-    def get_history(self, etf_code: str, days: int = 180) -> List[dict]:
+    def get_history(self, etf_code: str, days: int = 180,
+                    basis: str = "fixed") -> List[dict]:
+        """历史快照。默认 fixed（最新持仓回溯，柱子间可比）；basis='pit' 取旧口径。"""
         self.init()
         rows = self._conn().execute(
             "SELECT d, name, pe, g_ttm, g_all, peg, coverage, n_valid, n_total, report_date,"
-            " pb, ps, div_yield, pe_pct, pb_pct, ps_pct, div_calc "
-            "FROM etf_daily WHERE etf_code=? ORDER BY d DESC LIMIT ?", (etf_code, days)).fetchall()
+            " pb, ps, div_yield, pe_pct, pb_pct, ps_pct, div_calc, deduct_ttm, "
+            " np_ttm, deduct_pe, g_deduct, deduct_peg "
+            "FROM etf_daily WHERE etf_code=? AND basis=? ORDER BY d DESC LIMIT ?",
+            (etf_code, basis, days)).fetchall()
         return [{"date": r[0], "name": r[1], "pe": r[2], "g_ttm": r[3], "g_all": r[4],
                  "peg": r[5], "coverage": r[6], "n_valid": r[7], "n_total": r[8],
                  "report_date": r[9], "pb": r[10], "ps": r[11], "div_yield": r[12],
                  "pe_pct": r[13], "pb_pct": r[14], "ps_pct": r[15],
-                 "div_calc": r[16]} for r in rows]
+                 "div_calc": r[16], "deduct_ttm": r[17],
+                 "np_ttm": r[18], "deduct_pe": r[19], "g_deduct": r[20],
+                 "deduct_peg": r[21], "basis": basis} for r in rows]
+
+    def get_calc_version(self, etf_code: str, basis: str = "fixed") -> int:
+        """该 ETF 某口径的历史快照是用哪个计算口径版本算的（0 = 从未记录）"""
+        self.init()
+        row = self._conn().execute(
+            "SELECT version FROM etf_calc_version WHERE etf_code=? AND basis=?",
+            (etf_code, basis)).fetchone()
+        return row[0] if row else 0
+
+    def set_calc_version(self, etf_code: str, version: int,
+                         basis: str = "fixed") -> None:
+        """回填完成后记录口径版本；版本一致时下次只做增量"""
+        self.init()
+        with _WRITE_LOCK:
+            self._conn().execute(
+                "INSERT INTO etf_calc_version(etf_code, basis, version, updated_at) "
+                "VALUES (?,?,?,?) ON CONFLICT(etf_code, basis) DO UPDATE SET "
+                "version=excluded.version, updated_at=excluded.updated_at",
+                (etf_code, basis, version, date.today().isoformat()))
+            self._conn().commit()
 
     def pe_ranking(self, years: Optional[float] = None, top: int = 40,
                    min_days: int = 60) -> dict:
@@ -967,6 +1215,11 @@ class Store:
             "stock_pe_codes": q("SELECT COUNT(DISTINCT code) FROM stock_pe"),
             "stock_pe_range": c.execute(
                 "SELECT MIN(trade_date), MAX(trade_date) FROM stock_pe").fetchone(),
+            # 研报盈利预测（只有 A 股库有数据，港股库恒为 0）
+            "report_rows": q("SELECT COUNT(*) FROM report"),
+            "report_stocks": q("SELECT COUNT(DISTINCT stock_code) FROM report"),
+            "report_range": c.execute(
+                "SELECT MIN(publish_date), MAX(publish_date) FROM report").fetchone(),
         }
 
 

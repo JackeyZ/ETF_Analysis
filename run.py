@@ -62,12 +62,20 @@ def run_cli(code: str, mode: str) -> None:
     print("=" * 68)
     print(f"持仓报告期      : {r.report_date}  [{'全持仓' if r.holdings_full else '仅前十大重仓'}]")
     print(f"财报报告期      : {r.fin_period}")
-    print(f"成分股          : 共 {r.n_total} 只，有效 {r.n_valid} 只，权重覆盖率 {r.coverage:.1f}%")
+    print(f"成分股          : 共 {r.n_total} 只，PEG 有效 {r.n_valid} 只，权重覆盖率 {r.coverage:.1f}%")
     print(f"整体法 PE(TTM)  : {r.pe:.2f}" if r.pe else "整体法 PE(TTM)  : N/A")
     print(f"整体法增速(TTM) : {r.g_ttm:.2f}%" if r.g_ttm is not None else "整体法增速(TTM) : N/A")
     print(f"整体法增速(最新): {r.g_latest:.2f}%" if r.g_latest is not None else "整体法增速(最新): N/A")
-    print(f"全样本增速(TTM) : {r.g_all:.2f}%" if r.g_all is not None else "全样本增速(TTM) : N/A")
+    print(f"等权增速(TTM参照): {r.g_all:.2f}%" if r.g_all is not None else "等权增速(TTM参照): N/A")
     print(f"PEG             : {r.peg:.3f}" if r.peg else "PEG             : N/A")
+    print(f"扣非PE(整体法)  : {r.deduct_pe:.2f}" if r.deduct_pe else "扣非PE(整体法)  : N/A")
+    print(f"扣非增速(TTM)   : {r.g_deduct_ttm:.2f}%" if r.g_deduct_ttm is not None
+          else "扣非增速(TTM)   : N/A")
+    print(f"PEG(扣非口径)   : {r.deduct_peg:.3f}" if r.deduct_peg else "PEG(扣非口径)   : N/A")
+    print(f"归母净利(加权)  : {r.np_ttm_sum / 1e8:.1f} 亿" if r.np_ttm_sum is not None
+          else "归母净利(加权)  : N/A")
+    print(f"扣非净利(加权)  : {r.deduct_ttm_sum / 1e8:.1f} 亿" if r.deduct_ttm_sum is not None
+          else "扣非净利(加权)  : N/A")
     if r.peg_median:
         print(f"PEG(中位数法)   : {r.peg_median:.3f}   [稳健参考]")
     if r.peg_weighted_avg:
@@ -95,6 +103,8 @@ def main() -> None:
                     help="增速口径：ttm=TTM净利同比(稳健)；latest=最新报告期累计同比(灵敏)")
     ap.add_argument("--store", action="store_true", help="查看本地数据库状态")
     ap.add_argument("--history", metavar="ETF代码", help="查看该 ETF 的 PEG 历史序列")
+    ap.add_argument("--basis", choices=["fixed", "pit"], default="fixed",
+                    help="历史序列口径：fixed=最新持仓回溯(默认) / pit=当时已知持仓")
     ap.add_argument("--backfill", metavar="ETF代码",
                     help="回填该 ETF 的历史 PE/PEG（需配合 --days）")
     ap.add_argument("--days", type=int, default=180, help="回填天数，默认 180")
@@ -110,6 +120,9 @@ def main() -> None:
     ap.add_argument("--init-div", action="store_true",
                     help="初始化：拉取全市场 A 股的历次现金分红（约 20 分钟，可续传；"
                          "股息率历史柱状图需要）")
+    ap.add_argument("--sync-reports", action="store_true",
+                    help="同步全市场券商研报的盈利预测（2015 年至今约 14.8 万篇，"
+                         "首次 3~5 分钟；之后每次只补当年。成分股弹窗的历史预测靠它）")
     ap.add_argument("--no-open", action="store_true", help="启动后不自动打开浏览器")
     args = ap.parse_args()
 
@@ -142,11 +155,12 @@ def main() -> None:
         return
 
     if args.history:
-        rows = store.get_history(args.history, 365)
+        rows = store.get_history(args.history, 365, args.basis)
         if not rows:
             print(f"{args.history} 暂无历史快照；分析过该 ETF 后会自动记录当天数据。")
             return
-        print(f"{args.history} {rows[0]['name']}  共 {len(rows)} 个交易日快照\n")
+        print(f"{args.history} {rows[0]['name']}  共 {len(rows)} 个交易日快照"
+              f"（{args.basis} 口径）\n")
         print(f"{'日期':<12}{'PE':>9}{'增速%':>10}{'全样本%':>10}{'PEG':>9}{'覆盖%':>8}{'持仓期':>13}")
         for r in rows:
             f = lambda v, d=2: "—" if v is None else f"{v:.{d}f}"    # noqa: E731
@@ -231,6 +245,32 @@ def main() -> None:
             return
         print("\n\n完成：本次新拉 %d 只，失败 %d 只。"
               % (r["newly_done"], r["failed"]))
+        return
+
+    if args.sync_reports:
+        from etf_peg import reports as _rp
+        st0 = store.report_stats()
+        print("同步：全市场券商研报的盈利预测（2015 年至今）")
+        print(f"  库内现有：{st0['rows']:,} 篇 / {st0['stocks']:,} 只股票"
+              + (f"（{st0['start']} ~ {st0['end']}）" if st0["rows"] else "（空）"))
+        print("  往年拉过一次就不再回源，当年每次重拉；中断后重跑自动续传\n")
+        last = {"seg": ""}
+
+        def _prog(seg, done, total, new):
+            if seg != last["seg"]:
+                last["seg"] = seg
+                print()
+            _bar(done / total * 100 if total else 0,
+                 f"{seg} 年 {done}/{total} 页，本次新增 {new} 篇")
+
+        try:
+            r = _rp.sync(on_progress=_prog)
+        except KeyboardInterrupt:
+            print("\n\n已中断。已拉取的部分已入库，下次运行会继续。")
+            return
+        print(f"\n\n完成：本次新增 {r['new']:,} 篇，"
+              f"库内共 {r['rows']:,} 篇 / {r['stocks']:,} 只股票"
+              f"（{r['start']} ~ {r['end']}）")
         return
 
     if args.backfill:

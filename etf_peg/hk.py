@@ -97,6 +97,7 @@ def fetch_hk_list(force: bool = False) -> List[dict]:
     out: List[dict] = []
     page, size = 1, 100
     err = None
+    complete = False                # 是否翻完全部分页（残缺清单不能当全市场用）
     try:
         while page <= 200:
             params = {
@@ -107,6 +108,7 @@ def fetch_hk_list(force: bool = False) -> List[dict]:
             data = _get_json(_CLIST + urllib.parse.urlencode(params)).get("data") or {}
             diff = data.get("diff") or []
             if not diff:
+                complete = True                  # 正常翻到空页
                 break
             for it in diff:
                 code = it.get("f12")
@@ -118,14 +120,21 @@ def fetch_hk_list(force: bool = False) -> List[dict]:
                 out.append({"code": code, "name": it.get("f14"), "price": price,
                             "market_cap": mc, "shares": shares})
             if len(diff) < size:
+                complete = True                  # 最后一页
                 break
             page += 1
+        else:
+            complete = True                      # 到达翻页上限，视为完整
     except Exception as exc:                            # noqa: BLE001
         err = exc                                       # 交由下面的兜底处理
 
     if out:
         out.sort(key=lambda x: -(x["market_cap"] or 0))
-        ds.cache_put(_HK_LIST_KEY, out)
+        # 只有完整清单才进缓存：上游限流时常常第一页成功、第二页被掐，
+        # 这份 100 只的残缺清单一旦写进 6 小时缓存，全市场快照就只剩 100 只，
+        # 其余港股全部变成「无行情」——比多花几次翻页请求糟得多
+        if complete:
+            ds.cache_put(_HK_LIST_KEY, out)
         return out
 
     # 上游不可用时退回旧缓存（stale-while-error）：清单短时间内不会变，
@@ -409,9 +418,11 @@ def build_hk_ttm_timelines(hk_codes: List[str]) -> Dict[str, List[tuple]]:
     """
     为每只港股构建按其自身财年周期的 TTM 时间线。
 
-    返回 {code: [(生效日, np_ttm, np_ttm_prev, g, 基准期, rev_ttm, op_ttm), …]}
-    （按生效日升序）——元组结构与 A 股 build_pit_timelines 完全一致，
-    pit_as_of 与下游计算无需任何改动。
+    返回 {code: [(生效日, np_ttm, np_ttm_prev, g, 基准期, rev_ttm, op_ttm,
+                  deduct_ttm, deduct_ttm_prev), …]}（按生效日升序）——
+    元组结构与 A 股 build_pit_timelines 完全一致，pit_as_of 与下游计算
+    无需任何改动。港股没有「扣非」概念（非经常性损益不单独披露），
+    末两位固定为 None。
 
     生效日 = 报告期终 + 法定披露期限（年报 +4 个月、中报 +3 个月、
     季报 +2 个月，保守口径）。营收 / 营业利润的 TTM 用同一组报告、同一
@@ -445,7 +456,7 @@ def build_hk_ttm_timelines(hk_codes: List[str]) -> Dict[str, List[tuple]]:
             op_ttm = _ttm_at(by_date, e, span, "op_profit")
             eff = _shift_end(e, _DISCLOSE_MONTHS[span])            # 法定披露日
             tl.append((eff.isoformat(), ttm, ttm_prev, g,
-                       r["period"], rev_ttm, op_ttm))
+                       r["period"], rev_ttm, op_ttm, None, None))
         if tl:
             tl.sort(key=lambda x: x[0])
             out[code] = tl
@@ -523,10 +534,20 @@ def attach_mktcap(code: str, closes: List[dict],
 # --------------------------------------------------------------------------- #
 #  5. 当日全市场快照（实时分析用）
 # --------------------------------------------------------------------------- #
+# 快照拉取失败后的冷却：上游掐连接时 newest 节点要重试 4 次 × 超时，
+# 不冷却的话每次分析都要白白卡上一分钟
+_SNAP_FAIL_AT: Dict[str, float] = {}
+_SNAP_FAIL_TTL = 900
+
+
 def ensure_hk_market_snapshot(max_lag_days: int = 2, force: bool = False) -> Optional[str]:
     """
     把「最近交易日」全市场港股的收盘价与市值写入港股库，返回该日期。
     实时分析里港股 PE = 当日市值 ÷ 当日已披露的最新 TTM 净利，靠的就是这份数据。
+
+    拉不到新快照时**退回库里已有的旧快照**，而不是返回 None：
+    港股行情挂了就把现价和 PE 全变成「—」，等于整块港股估值消失，
+    用几天前的收盘价算出来的 PE 只是略有滞后，仍然可用。
     """
     d = store.HK.latest_market_pe_date()
     if d and not force:
@@ -536,18 +557,27 @@ def ensure_hk_market_snapshot(max_lag_days: int = 2, force: bool = False) -> Opt
         except Exception:                               # noqa: BLE001
             pass
 
+    last = _SNAP_FAIL_AT.get("snap")
+    if last and not force and time.time() - last < _SNAP_FAIL_TTL:
+        return d                                        # 刚失败过，直接用旧快照
+
     target = latest_trade_date()
     if not target:
-        return None
+        _SNAP_FAIL_AT["snap"] = time.time()
+        return d                                        # 探测不到交易日 → 退回旧快照
     lst = fetch_hk_list(force=force)
-    if not lst:
-        return None
+    # 清单残缺（上游翻页被掐）时宁可不写：只覆盖 100 只的「全市场快照」
+    # 会让其余港股统统变成无行情，比用几天前的完整快照更糟
+    if not lst or len(lst) < 1000:
+        _SNAP_FAIL_AT["snap"] = time.time()
+        return d
 
     rows = [{"date": target, "code": c["code"], "pe_ttm": None, "pe_lar": None,
              "mktcap": c.get("market_cap"), "close": c.get("price")}
             for c in lst if c.get("market_cap")]
     if rows:
         store.HK.save_stock_pe(rows)
+        _SNAP_FAIL_AT.pop("snap", None)
     return target
 
 
