@@ -321,7 +321,8 @@
           </select>
           <select id="histMetric" style="padding:6px 9px;font-size:12.5px">
             <option value="peg" selected>PEG</option>
-            <option value="pe">PE</option>
+            <option value="pe">PE（盈利股）</option>
+            <option value="pe_all">PE（含亏损·全样本）</option>
             <option value="pb">PB</option>
             <option value="ps">PS</option>
             <option value="g_ttm">增速%</option>
@@ -735,7 +736,14 @@ function renderResult(d, mode) {
      n: d.deduct_peg == null ? '扣非PE ÷ 扣非加权增速；扣非增速≤0 时为空（当前大概率处于亏损周期）'
        : '扣非PE ÷ 扣非加权增速（制造业口径，剔除一次性损益）',
      d: 2, c: cls(d.deduct_peg)},
-    {k: 'PE-TTM（整体法）', v: d.pe, n: 'Σ总市值 ÷ Σ归母净利润', d: 2},
+    {k: 'PE-TTM（盈利股）', v: d.pe,
+     n: `Σw/Σ(w/PE)，只含盈利股`
+       + (d.pe_coverage != null ? ` · 覆盖 ${d.pe_coverage.toFixed(0)}% 权重` : ''), d: 2},
+    {k: 'PE-TTM（含亏损）', v: d.pe_all,
+     n: d.pe_all == null
+       ? '合计净利 ≤ 0，PE 无意义 → 看 PB / PS / 前瞻PE'
+       : `Σw/Σ(w·净利/市值)，亏损股以负净利进分母`
+         + (d.pe_all_coverage != null ? ` · 覆盖 ${d.pe_all_coverage.toFixed(0)}%` : ''), d: 2},
     {k: '扣非PE（整体法）', v: d.deduct_pe,
      n: d.deduct_pe == null ? '扣非TTM 全为负，扣非PE 无意义'
        : 'Σw / Σ(w·扣非TTM/市值)，只含扣非TTM>0 的股票', d: 2},
@@ -747,7 +755,9 @@ function renderResult(d, mode) {
        : '全口径加权：Σ(w·净利) 的本期累计同比，含亏损/负增长股', d: 2, u: '%',
      c: g === null ? '' : (g > 0 ? 'g' : 'b')},
     {k: 'PEG（中位数法）', v: d.peg_median, n: 'PE中位数 ÷ 增速中位数（仅正增长样本），抗极端值', d: 2},
-    {k: '权重覆盖率', v: d.coverage, n: `PEG 有效样本 ${d.n_valid} / 共 ${d.n_total} 只`, d: 1, u: '%',
+    {k: 'PEG 样本覆盖率', v: d.coverage,
+     n: `PE>0 且增速>0：${d.n_valid}/${d.n_total} 只`
+       + (d.pe_coverage != null ? ` · PE 样本覆盖 ${d.pe_coverage.toFixed(0)}%` : ''), d: 1, u: '%',
      c: d.coverage >= 70 ? 'g' : (d.coverage >= 50 ? 'w' : 'b')},
     {k: '等权增速（TTM·对照）', v: d.g_all, n: '简单相加（不乘权重），与加权口径的差额=持仓集中度影响', d: 2, u: '%',
      c: d.g_all > 0 ? 'g' : 'b'},
@@ -862,7 +872,8 @@ function plTable(d) {
   const pl = d.percentile;
   if (!pl) return '';
   const rows = [
-    {k: 'PE-TTM', cur: d.pe, v: pl.pe, lo: 0, hi: null},
+    {k: 'PE-TTM（盈利股）', cur: d.pe, v: pl.pe, lo: 0, hi: null},
+    {k: 'PE-TTM（含亏损）', cur: d.pe_all, v: pl.pe_all, lo: 0, hi: null},
     {k: 'PB', cur: d.pb, v: pl.pb, lo: 0, hi: null},
     {k: 'PS', cur: d.ps, v: pl.ps, lo: 0, hi: null},
   ].filter(r => r.v);
@@ -901,6 +912,11 @@ function renderValuation(d) {
   box.style.display = 'block';
 
   const metrics = [
+    {k: 'PE（盈利股整体法）', v: d.pe, cov: d.pe_coverage, u: '',
+     n: 'Σw/Σ(w/PE)，只含 PE>0 的成分股；亏损股不进分母'},
+    {k: 'PE（含亏损整体法）', v: d.pe_all, cov: d.pe_all_coverage, u: '',
+     n: 'Σw/Σ(w·净利/市值)，亏损股以负净利进分母（中证/Wind 通行口径）；'
+       + '合计净利≤0 时为空（PE 无定义）'},
     {k: 'PB（市净率）', v: d.pb, cov: d.pb_coverage, u: '',
      n: 'Σw/Σ(w/PB)。周期底部 PE 为负或极高时，PB 是主要参照'},
     {k: 'PS（市销率·TTM）', v: d.ps, cov: d.ps_coverage, u: '',
@@ -1369,7 +1385,11 @@ function buildAiReport(d, hist, extra) {
     ['名称', d.name], ['代码', d.code], ['基金类型', d.fund_type],
     ['股票仓位', d.equity_ratio != null ? fmt(d.equity_ratio, 1) + '%' : null],
     ['A股/港股/其他', `${d.n_a} / ${d.n_hk} / ${d.n_oversea} 只`],
-    ['持仓完整性', d.holdings_full === false ? '仅季报前十大重仓（样本不完整）' : '全持仓（半年报/年报）'],
+    ['持仓完整性', d.holdings_full === false
+      ? '仅季报前十大重仓（样本不完整）'
+      : (d.holdings_base_report && d.holdings_base_report !== d.report_date
+        ? `全持仓（前十大权重按 ${d.report_date} 最新定期报告更新，其余为 ${d.holdings_base_report} 权重）`
+        : '全持仓（半年报/年报）')],
   ];
   if (d.oversea_weight) {
     info.push(['其他市场权重', fmt(d.oversea_weight, 2) + '%（美股等，无估值数据，未计入）']);
@@ -1405,7 +1425,12 @@ function buildAiReport(d, hist, extra) {
     ['PEG（整体法）', fmt(d.peg, 3), 'PE ÷ 加权增速；增速≤0 时为空'],
     ['PEG（扣非口径）', fmt(d.deduct_peg, 3),
       '扣非PE ÷ 扣非加权增速；扣非增速≤0 时为空（亏损周期常见）'],
-    ['PE-TTM（整体法）', fmt(d.pe, 2), 'Σ持仓市值 ÷ Σ归母净利润'],
+    ['PE-TTM（盈利股）', fmt(d.pe, 2),
+      `Σw/Σ(w/PE)，只含盈利股${d.pe_coverage != null ? `（样本覆盖 ${fmt(d.pe_coverage, 0)}% 权重）` : ''}`],
+    ['PE-TTM（含亏损·全样本）', fmt(d.pe_all, 2),
+      d.pe_all == null
+        ? '合计归母净利 ≤ 0，整体法 PE 无定义（负值/无穷），请改用 PB / PS / 前瞻PE'
+        : `Σw/Σ(w·净利/市值)，亏损股以负净利进分母${d.pe_all_coverage != null ? `（样本覆盖 ${fmt(d.pe_all_coverage, 0)}% 权重）` : ''}`],
     ['扣非PE（整体法）', fmt(d.deduct_pe, 2),
       'Σw / Σ(w·扣非TTM/市值)，只含扣非TTM>0 的股票'],
     ['归母净利增速（TTM）', fmt(d.g_ttm, 2) + '%',
@@ -1426,7 +1451,10 @@ function buildAiReport(d, hist, extra) {
       'Σ(w·扣非TTM)，与归母同一组报告期；港股/缺扣非用归母顶上']] : []),
     ['PEG（中位数法）', fmt(d.peg_median, 3), 'PE中位数 ÷ 增速中位数（仅正增长样本），抗极端值'],
     ['PEG（权重加权平均）', fmt(d.peg_weighted_avg, 3), '成分股 PEG 加权平均，易被极端值带偏'],
-    ['有效样本覆盖率', fmt(d.coverage, 1) + '%', `${d.n_valid}/${d.n_total} 只（仅用于 PEG 与中位数）`],
+    ['PEG 样本覆盖率', fmt(d.coverage, 1) + '%',
+      `${d.n_valid}/${d.n_total} 只（PE>0 且正增长，仅用于 PEG 与中位数）`],
+    ['PE 样本覆盖率', d.pe_coverage != null ? fmt(d.pe_coverage, 1) + '%' : '—',
+      '盈利股整体法 PE 的权重占比；与 PEG 覆盖率不是一回事'],
     ['有效样本', `${d.n_valid} / ${d.n_total}`, 'PE>0 且正增长的成分股（不用于组合增速）'],
     ...(d.pb != null ? [['PB（整体法）', fmt(d.pb, 2),
       `Σw/Σ(w/PB)${d.pb_coverage != null && d.pb_coverage < 100 ? `，样本覆盖 ${fmt(d.pb_coverage, 0)}%` : ''}；周期底部 PE 失真时的主要参照`]] : []),
@@ -1645,10 +1673,25 @@ function buildAiReport(d, hist, extra) {
       const w = wMap[p.code];
       L.push(`#### ${p.code} ${p.name}`
         + (w != null ? ` ｜ 权重 ${fmt(w, 2)}%` : '')
-        + ` ｜ 近 36 个月有研报的 ${p.n_org} 家机构（库内共 ${p.total} 篇）`);
+        + (p.no_eps
+          ? ` ｜ 近 36 个月 ${p.n_org} 家机构评级（库内共 ${p.total} 条）`
+          : ` ｜ 近 36 个月有研报的 ${p.n_org} 家机构（库内共 ${p.total} 篇）`));
       L.push('');
       if (!ys.length) {
-        L.push('（这些研报都没有给出分年度 EPS 预测）');
+        if (!p.no_eps) {
+          L.push('（这些研报都没有给出分年度 EPS 预测）');
+          L.push('');
+          return;
+        }
+        // 港股：只有大行评级（机构 / 评级 / 目标价），没有分年度 EPS
+        L.push('| 机构 | 日期 | 评级（前次） | 目标价 | 前目标价 |');
+        L.push('|---|---|---|---|---|');
+        (p.orgs || []).forEach(o => (o.rows || []).forEach((r, i) => {
+          L.push(`| ${i === 0 ? o.name : '〃'} | ${r.d}`
+            + ` | ${r.r || '—'}${r.lr ? '（' + r.lr + '）' : ''}`
+            + ` | ${r.t == null ? '—' : fmt(r.t, 2)}`
+            + ` | ${r.pt == null ? '—' : fmt(r.pt, 2)} |`);
+        }));
         L.push('');
         return;
       }
@@ -1675,8 +1718,9 @@ function buildAiReport(d, hist, extra) {
       });
       L.push('');
     });
-    L.push('> 港股/美股没有免费的逐篇研报源，只有 A 股成分参与。'
-      + '「—」表示该机构未对相应财年给出预测，「〃」表示与上一行同一家机构。');
+    L.push('> 港股为大行评级（机构 / 评级 / 目标价，含前次评级与前目标价），'
+      + '**没有分年度 EPS 预测**，因此不参与一致预期与前瞻 PEG；美股无免费数据。'
+      + '「—」表示该项缺失，「〃」表示与上一行同一家机构。');
     L.push('');
   }
 
@@ -1746,10 +1790,10 @@ function buildAiReport(d, hist, extra) {
     L.push(`### 7.1 最近一个月逐日（${recentDaily[0].date} ~ `
       + `${recentDaily[recentDaily.length - 1].date}，${recentDaily.length} 个交易日）`);
     L.push('');
-    L.push('| 日期 | PE | 增速% | PEG | 扣非PE | 扣非增速% | 扣非PEG | 归母净利(亿) | 扣非净利(亿) | 覆盖率% |');
-    L.push('|---|---|---|---|---|---|---|---|---|---|');
+    L.push('| 日期 | PE | PE含亏损 | 增速% | PEG | 扣非PE | 扣非增速% | 扣非PEG | 归母净利(亿) | 扣非净利(亿) | 覆盖率% |');
+    L.push('|---|---|---|---|---|---|---|---|---|---|---|');
     recentDaily.forEach(r => L.push(
-      `| ${r.date} | ${fmt(r.pe, 2)} | ${fmt(r.g_ttm, 2)} | ${fmt(r.peg, 3)}`
+      `| ${r.date} | ${fmt(r.pe, 2)} | ${fmt(r.pe_all, 2)} | ${fmt(r.g_ttm, 2)} | ${fmt(r.peg, 3)}`
       + ` | ${fmt(r.deduct_pe, 2)} | ${fmt(r.g_deduct, 2)} | ${fmt(r.deduct_peg, 3)}`
       + ` | ${r.np_ttm != null ? fmt(r.np_ttm / 1e8, 2) : '—'}`
       + ` | ${r.deduct_ttm != null ? fmt(r.deduct_ttm / 1e8, 2) : '—'}`
@@ -1762,11 +1806,12 @@ function buildAiReport(d, hist, extra) {
   if (months.length) {
     L.push(`### 7.2 逐月（全部历史，${months.length} 个月）`);
     L.push('');
-    L.push('| 月末 | PE-TTM | PE区间 | 增速% | PEG | PEG区间 | 扣非PE | 扣非增速% | 扣非PEG | PB | PS | 归母净利(亿) | 扣非净利(亿) | 股息率% | 覆盖率% |');
-    L.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|');
+    L.push('| 月末 | PE-TTM | PE区间 | PE含亏损 | 增速% | PEG | PEG区间 | 扣非PE | 扣非增速% | 扣非PEG | PB | PS | 归母净利(亿) | 扣非净利(亿) | 股息率% | 覆盖率% |');
+    L.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|');
     months.forEach(m => L.push(
       `| ${m.date} | ${fmt(m.pe, 2)}`
       + ` | ${fmt(m.pe_lo, 2)}~${fmt(m.pe_hi, 2)}`
+      + ` | ${fmt(m.pe_all, 2)}`
       + ` | ${fmt(m.g_ttm, 2)} | ${fmt(m.peg, 3)}`
       + ` | ${m.peg_lo != null ? fmt(m.peg_lo, 3) + '~' + fmt(m.peg_hi, 3) : '—'}`
       + ` | ${fmt(m.deduct_pe, 2)} | ${fmt(m.g_deduct, 2)} | ${fmt(m.deduct_peg, 3)}`
@@ -1830,7 +1875,8 @@ function buildAiReport(d, hist, extra) {
   }
   L.push('- **成分股盈利预测**来自券商研报（东财研报中心，2017 年起约 14.8 万篇）：'
     + '报告正文给的是逐机构最新一篇的原始预测与各家自身的修正幅度，**不做平均聚合**；'
-    + '港股/美股没有免费的逐篇研报源，不参与');
+    + '港股补充的是东财 F10「大行评级」（机构/评级/目标价，**无 EPS 预测**），'
+    + '美股无免费数据，两者都不参与前瞻 PEG');
   L.push('- A 股 PE 为东财 PE-TTM 口径；**港股无现成历史 PE，由 当日总市值 ÷ TTM股东应占溢利 自算**，且港股财报为半年度（中报/年报），更新节奏比 A 股慢半年');
   L.push('- **历史序列为「最新持仓回溯」口径（fixed）**：全部历史统一用最新一期持仓权重，'
     + '财报/行情仍按披露日 PIT。因此「归母净利(亿)」柱子之间可直接比较，'
@@ -1885,7 +1931,7 @@ async function getAiReport() {
   let panel = [];
   try {
     const codes = (CUR.stocks || []).slice(0, 20)
-      .map(s => String(s.code)).filter(c => /^\d{6}$/.test(c));
+      .map(s => String(s.code)).filter(c => /^\d{5,6}$/.test(c));   // 含港股 5 位
     if (codes.length) {
       // 每家机构最近 4 篇、近 36 个月：窗口太窄会把旧财年（2024E/2025E）的研报排除掉
       const j = await api(`/api/stock/forecast/panel?codes=${codes.join(',')}`
@@ -2030,8 +2076,8 @@ function drawHist() {
       + ` text-anchor="middle">${t}</text>`;
   };
 
-  const MNAME = { peg: 'PEG', pe: 'PE-TTM', pb: 'PB', ps: 'PS', g_ttm: '增速%',
-                  g_deduct: '扣非增速%', deduct_peg: '扣非PEG',
+  const MNAME = { peg: 'PEG', pe: 'PE(盈利股)', pe_all: 'PE(含亏损)', pb: 'PB', ps: 'PS',
+                  g_ttm: '增速%', g_deduct: '扣非增速%', deduct_peg: '扣非PEG',
                   np_ttm: '归母净利(亿)', deduct_ttm: '扣非净利(亿)', div_yield: '股息率%' };
 
   let grid = '';
@@ -2075,7 +2121,9 @@ function drawHist() {
         plot += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${Math.min(y0, y1).toFixed(1)}"`
           + ` width="${bw.toFixed(1)}" height="${Math.max(1, Math.abs(y1 - y0)).toFixed(1)}"`
           + ` fill="${col}" rx="2"><title>${r.key}｜${MNAME[metric]} ${v.toFixed(metric === 'peg' ? 3 : 2)}`
-          + (metric === 'pe' ? `｜区间 ${r.pe_lo != null ? r.pe_lo.toFixed(2) : '—'}~${r.pe_hi != null ? r.pe_hi.toFixed(2) : '—'}` : '')
+          + ((metric === 'pe' || metric === 'pe_all') && r[metric + '_lo'] != null
+            ? `｜区间 ${r[metric + '_lo'].toFixed(2)}~${r[metric + '_hi'] != null ? r[metric + '_hi'].toFixed(2) : '—'}`
+            : '')
           + `｜持仓期 ${r.report_date || '—'}｜${r.days || 1} 个交易日</title></rect>`;
       }
       if (i % step === 0) labels += xLabel(i, lblOf(r));
@@ -2113,11 +2161,17 @@ function drawHist() {
                 : metric === 'np_ttm'
                   ? `<b>归母净利（全口径加权）</b> = Σ(持仓权重 × TTM归母净利)，`
                     + `与扣非净利同规则；不是当季/当月利润。`
-                  : `上游个股每日 PE 最早 2018-01-02，更早无法回填。`)
+                  : metric === 'pe_all'
+                    ? `<b>全样本整体法（含亏损）</b>：Σw / Σ(w·净利/市值)，`
+                      + `亏损股以负净利润进分母，不剔除任何成分股；`
+                      + `只有当日合计净利 &gt; 0 才有柱子，合计亏损的时段为空（PE 无定义），`
+                      + `此时应看 PB / PS / 前瞻PE。`
+                    : `上游个股每日 PE 最早 2018-01-02，更早无法回填。`)
     + (metric === 'g_ttm' || metric === 'g_deduct' || metric === 'np_ttm' || metric === 'deduct_ttm'
         ? ` <b>增速为什么是台阶状</b>：这几个指标由成分股财报驱动，只在披露新一期财报时变动，`
           + `季度内多是小幅漂移；「按季」取该季最后一个交易日的值（= 按月序列里每 3 根取 1 根），`
-          + `所以按季柱子更少、台阶位置与按月一致。PE / PB / PS / PEG 由股价驱动，按月与按季差别才明显。`
+          + `所以按季柱子更少、台阶位置与按月一致。PE / PE含亏损 / PB / PS / PEG 由股价驱动，`
+          + `按月与按季差别才明显。`
         : '')
     + `</div>`;
 }
@@ -2292,6 +2346,7 @@ function renderDaily() {
     <tr>
       <td class="l mono">${r.date}</td>
       <td>${fmt(r.pe)}</td>
+      <td>${fmt(r.pe_all)}</td>
       <td class="${r.g_ttm > 0 ? 'g' : 'b'}">${pct(r.g_ttm, 1)}</td>
       <td class="${cls(r.peg)}"><b>${fmt(r.peg, 3)}</b></td>
       <td class="${(r.div_yield ?? 0) >= 3 ? 'g' : ''}">${pct(r.div_yield, 2)}</td>
@@ -2302,7 +2357,7 @@ function renderDaily() {
     <div class="tbl-wrap" style="max-height:260px">
       <table>
         <thead><tr>
-          <th class="l">日期</th><th>PE</th><th>增速%</th><th>PEG</th><th>股息率%</th><th>覆盖%</th><th class="l">持仓期</th>
+          <th class="l">日期</th><th>PE</th><th>PE含亏损</th><th>增速%</th><th>PEG</th><th>股息率%</th><th>覆盖%</th><th class="l">持仓期</th>
         </tr></thead>
         <tbody>${tb}</tbody>
       </table>
@@ -2820,10 +2875,30 @@ async function refreshForecast(code) {
   }
 }
 
-function fcChart(series, targets, single) {
+function fcChart(series, targets, single, price) {
   if (!series || !series.length) return '<div class="empty">没有可绘制的预测序列</div>';
-  const W = 880, H = 250, PL = 56, PR = 18, PT = 14, PB = 30;
-  const xs = series.map(s => s.m);
+  const W = 880, H = 250, PL = 56, PT = 14, PB = 30;
+
+  // 月末股价画在右轴：股价 ÷ 预测 EPS = 市场给的隐含 PE
+  const pByM = {};
+  (price || []).forEach(p => { if (p && p.c != null) pByM[p.m] = p.c; });
+  const hasP = Object.keys(pByM).length >= 2;
+  const PR = hasP ? 58 : 18;
+
+  let xs = series.map(s => s.m);
+  if (hasP) {
+    // 研报通常比行情晚 1~2 个月：最多往后延 3 个月，让「当前价位」也落在图上
+    const mi = m => +m.slice(0, 4) * 12 + (+m.slice(5, 7));
+    const lastS = xs[xs.length - 1], lastP = Object.keys(pByM).sort().pop();
+    if (lastP > lastS && mi(lastP) - mi(lastS) <= 3) {
+      Object.keys(pByM).forEach(m => { if (m > lastS) xs.push(m); });
+    }
+    xs = [...new Set(xs)].sort();
+  }
+  // 月份 → 横轴下标：xs 可能被股价延长，EPS 取点要按月查，不能直接用原下标
+  const xi = {};
+  xs.forEach((m, i) => { xi[m] = i; });
+
   const vals = [];
   series.forEach(s => targets.forEach(y => {
     const v = s.v[y];
@@ -2840,6 +2915,18 @@ function fcChart(series, targets, single) {
     : i * (W - PL - PR) / (xs.length - 1));
   const Y = v => PT + (hi - v) * (H - PT - PB) / ((hi - lo) || 1);
 
+  // 股价轴：与左轴共用同一组 y 像素，右轴刻度独立换算
+  const pPts = [];
+  xs.forEach((m, i) => { if (pByM[m] != null) pPts.push([i, pByM[m]]); });
+  let pLo = 0, pHi = 1;
+  if (pPts.length) {
+    const pv = pPts.map(p => p[1]);
+    pLo = Math.min.apply(null, pv); pHi = Math.max.apply(null, pv);
+    const p2 = (pHi - pLo) * 0.06 || Math.abs(pHi) * 0.03 || 1;
+    pLo -= p2; pHi += p2;
+  }
+  const YP = v => PT + (pHi - v) * (H - PT - PB) / ((pHi - pLo) || 1);
+
   let grid = '';
   for (let k = 0; k <= 4; k++) {
     const v = lo + (hi - lo) * k / 4, y = Y(v);
@@ -2847,6 +2934,11 @@ function fcChart(series, targets, single) {
       stroke="#2a3140"/>`;
     grid += `<text x="${PL - 8}" y="${(y + 3.5).toFixed(1)}" fill="#8b949e"
       font-size="10.5" text-anchor="end">${v.toFixed(2)}</text>`;
+    if (hasP) {
+      const pv = pLo + (pHi - pLo) * k / 4;
+      grid += `<text x="${W - PR + 8}" y="${(y + 3.5).toFixed(1)}" fill="#8b949e"
+        font-size="10.5">${pv >= 100 ? pv.toFixed(0) : pv.toFixed(2)}</text>`;
+    }
   }
 
   const step = Math.max(1, Math.ceil(xs.length / 9));
@@ -2854,19 +2946,33 @@ function fcChart(series, targets, single) {
     ? `<text x="${X(i).toFixed(1)}" y="${H - 8}" fill="#8b949e" font-size="10"
         text-anchor="middle">${m.slice(2)}</text>` : '').join('');
 
+  // 股价线先画，EPS 圆点压在上面，避免抢悬停
+  let priceSvg = '';
+  if (pPts.length > 1) {
+    const d = pPts.map(([i, v], k) =>
+      `${k ? 'L' : 'M'}${X(i).toFixed(1)},${YP(v).toFixed(1)}`).join(' ');
+    const last = pPts[pPts.length - 1];
+    priceSvg = `<path d="${d}" fill="none" stroke="#e6edf3" stroke-width="1.5"
+        stroke-opacity=".8" stroke-dasharray="4 3">
+        <title>股价（月末收盘，不复权，右轴）</title></path>`
+      + `<circle cx="${X(last[0]).toFixed(1)}" cy="${YP(last[1]).toFixed(1)}" r="2.6"
+        fill="#e6edf3"><title>${xs[last[0]]} 收盘 ${last[1]} 元</title></circle>`;
+  }
+
   const lines = targets.map((y, k) => {
     const c = FC_COLORS[k % FC_COLORS.length];
     const pts = [];
-    series.forEach((s, i) => {
+    series.forEach(s => {
       const v = s.v[y];
-      if (v != null) pts.push([X(i), Y(v)]);
+      if (v != null) pts.push([X(xi[s.m]), Y(v)]);
     });
     if (!pts.length) return '';
     const d = pts.map((p, i) =>
       `${i ? 'L' : 'M'}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ');
-    const dots = series.map((s, i) => {
+    const dots = series.map(s => {
       const v = s.v[y];
       if (v == null) return '';
+      const i = xi[s.m];
       const n = (s.n || {})[y] || 1;
       // 单机构模式下每个点就是一篇研报，不存在「几家机构」，圆点大小固定
       const r = single ? 3 : Math.min(4.5, 1.6 + n * 0.22);
@@ -2881,7 +2987,7 @@ function fcChart(series, targets, single) {
 
   return `<div class="tbl-wrap" style="max-height:none;padding:4px 0">
     <svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block">
-      ${grid}${xlab}${lines}
+      ${grid}${priceSvg}${xlab}${lines}
     </svg></div>`;
 }
 
@@ -2898,7 +3004,7 @@ function renderForecast(d) {
     body.innerHTML = `<div class="empty" style="line-height:2">
       ${d.msg || '该股暂无研报数据。'}<br>
       <span class="muted" style="font-size:12px">
-        研报接口只覆盖 A 股，港股与美股没有免费的等价数据源。
+        研报预测覆盖 A 股；港股有大行评级（无 EPS 预测）；美股无免费数据。
       </span></div>`;
     return;
   }
@@ -2908,6 +3014,27 @@ function renderForecast(d) {
     + (d.n_org_fc != null && d.n_org_fc < d.n_org ? `（${d.n_org_fc} 家给了分年度预测）` : '')
     + ` · ${d.start} ~ ${d.end}`
     + (d.industry ? ` · ${d.industry}` : '');
+
+  // 港股：只有大行评级与目标价，没有分年度 EPS，画不了预测曲线，直接列表
+  if (d.no_eps) {
+    sub.textContent = `${d.total} 条大行评级 · ${d.n_org} 家机构 · ${d.start} ~ ${d.end}`;
+    const rows = (d.detail || []).map(r =>
+      `<tr><td class="l">${r.date}</td>`
+      + `<td class="l">${r.org || '—'}</td>`
+      + `<td>${r.rating || '—'}${r.last_rating && r.last_rating !== r.rating
+        ? `<span class="muted" style="font-size:11px">（前 ${r.last_rating}）</span>` : ''}</td>`
+      + `<td>${r.target != null ? fmt(r.target, 2) : '—'}</td>`
+      + `<td>${r.prev_target != null ? fmt(r.prev_target, 2) : '—'}</td></tr>`).join('');
+    body.innerHTML = `<div class="muted" style="font-size:12px;margin:0 0 8px;line-height:1.7">
+        港股不披露分年度 EPS 预测，这里是逐篇大行评级与目标价（含前次）。
+      </div>
+      <div class="tbl-wrap" style="max-height:56vh">
+      <table style="font-size:12.5px"><thead><tr>
+        <th class="l">日期</th><th class="l">机构</th><th>评级</th>
+        <th>目标价</th><th>前目标价</th>
+      </tr></thead><tbody>${rows}</tbody></table></div>`;
+    return;
+  }
 
   const targets = d.targets || [];
 
@@ -3027,6 +3154,8 @@ function updateForecastView() {
 
   const sel = [...(FC_YEARS || new Set(d.targets || []))].sort((a, b) => a - b);
   const org = FC_ORG ? (d.orgs || []).find(o => o.key === FC_ORG) : null;
+  const pLegend = (d.price && d.price.length > 1)
+    ? `<span><i style="background:#e6edf3"></i>股价（元，右轴）</span>` : '';
 
   if (org) {
     // 该机构未必预测过所有财年，只画它自己有值的年份，否则会画出空线
@@ -3036,8 +3165,9 @@ function updateForecastView() {
       + `<span><b style="color:var(--txt)">${org.name}</b> 历次研报 ${org.rows.length} 篇</span>`
       + use.map((y, i) =>
         `<span><i style="background:${FC_COLORS[i % FC_COLORS.length]}"></i>${y}E</span>`).join('')
+      + pLegend
       + `<span style="margin-left:auto">悬停圆点看日期与数值</span></div>`
-      + fcChart(orgSeries(org.rows), use, true);
+      + fcChart(orgSeries(org.rows), use, true, d.price);
     detailBox.innerHTML = orgTable(org, sel);
   } else {
     const byYear = d.series_by_year || {};
@@ -3046,8 +3176,9 @@ function updateForecastView() {
       + sel.map((y, i) =>
         `<span><i style="background:${FC_COLORS[i % FC_COLORS.length]}"></i>${y}E 一致预期 EPS（元）</span>`
       ).join('')
+      + pLegend
       + `<span style="margin-left:auto">圆点越大 = 当月出预测的机构越多</span></div>`
-      + (merged.length ? fcChart(merged, sel, false)
+      + (merged.length ? fcChart(merged, sel, false, d.price)
         : '<div class="empty">所选财年没有可绘制的数据</div>');
     detailBox.innerHTML = allTable(d, sel);
   }

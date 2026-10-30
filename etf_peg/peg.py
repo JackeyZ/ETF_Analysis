@@ -8,6 +8,8 @@ PEG 计算引擎。
    算术平均会被微利股 / 亏损股严重污染（PE=1000 和 PE=10 平均是 505，毫无意义）。
    整体法：PE_组合 = Σ总市值 / Σ归母净利润(TTM)，等价于按市值加权的调和平均，
    是指数公司（中证、国证）与 Wind 的通行口径。
+   工具同时给两个口径：PE（盈利股，Σw/Σ(w/PE)，剔除亏损）与
+   PE_all（全样本，Σw/Σ(w·NP/MC)，亏损股以负净利进分母）。
 
 2) 增速 G 用 TTM 归母净利润同比
    TTM_本期 = 本期累计归母 + 上年年报归母 - 去年同期累计归母
@@ -75,7 +77,18 @@ from . import store
 #        - pit：每期用当时已知持仓（旧口径），无前视但含调仓影响。
 #        背景：013816 的 2026-08 增速 -36% 而净利柱子从 0.6 亿涨到 8.8 亿——
 #        PIT 下两年用的不是同一套持仓（53 只 vs 69 只），分母 13.8 亿≠去年柱子。
-CALC_VERSION = 10
+#   v11: 新增**全样本整体法 PE（含亏损）** pe_all = Σw / Σ(w·NP_i/MC_i)。
+#        旧 pe 用 Σw/Σ(w/PE_i)，PE_i>0 才有意义，等于把亏损股整只剔除，
+#        亏损权重越大、对 PE 的低估越多（亏损股以负 E/P 进分母才是通行口径）。
+#        合计净利 ≤ 0 时 pe_all 无意义（负值/无穷），置 None 并提示改用 PB/PS。
+#        历史序列 etf_daily 新增 pe_all / pe_all_coverage 两列，靠升版重算补齐。
+CALC_VERSION = 11
+
+# 回填时某天「有市值的权重」低于此比例即视为行情残缺，跳过该日不写。
+# 港股快照 / 日 K 只回了一部分时，算出来的是几只股票的 PE——比没有值更糟，
+# 而且会覆盖掉实时分析刚写入的正确数据（021891 实测：2026-10-27 只有 6/50 只
+# 有行情，pe 从 22.24 被改写成 36.16、pe_all 从 37.25 改写成 45.19）。
+MIN_MC_COVERAGE = 0.5
 
 
 # --------------------------------------------------------------------------- #
@@ -133,6 +146,10 @@ class ETFResult:
     report_date: Optional[str]
     fin_period: Optional[str]
     holdings_full: bool = True      # False = 只拿到季报前十大，样本不完整
+    # 长尾权重的来源期：前十大权重已按 report_date（最新一期季报）更新，
+    # 其余成分股沿用 base_report（最近一期半年报/年报）的权重并按比例缩放。
+    # 与 report_date 相同或为空 = 单一期次的全持仓，无缺口。
+    holdings_base_report: Optional[str] = None
     pe_date: Optional[str] = None   # PE 数据日期（PE-TTM 口径，滞后 1~2 个交易日）
     hk_pe_date: Optional[str] = None  # 港股行情快照日期（A 股估值库不含港股，单独标注）
     fin_basis: Optional[dict] = None  # 增速的计算依据：用到了哪几份报告
@@ -148,7 +165,13 @@ class ETFResult:
     n_total: int = 0
     n_valid: int = 0
     coverage: float = 0.0                 # 有效样本权重覆盖率 %
-    pe: Optional[float] = None            # 整体法 PE
+    pe: Optional[float] = None            # 整体法 PE（盈利股口径：只含 PE>0）
+    # ---- 全样本整体法 PE（含亏损）----
+    # PE_all = Σw / Σ(w·NP_i/MC_i)：亏损股以负净利润进分母，不做任何样本筛选。
+    # 与 pe 的唯一差别是不再跳过 NP<=0；只有合计净利>0 时才有意义。
+    pe_all: Optional[float] = None
+    pe_all_coverage: Optional[float] = None   # 参与 PE_all 的权重 / 可估值权重 %
+    pe_coverage: Optional[float] = None       # 盈利股口径（pe）的权重占比 %
     g_ttm: Optional[float] = None         # 整体法 TTM 净利增速 %（正增长样本）
     g_latest: Optional[float] = None      # 整体法 最新报告期累计增速 %（正增长样本）
     g_all: Optional[float] = None         # 全样本（含负增长）整体法 TTM 增速 %，用于衡量剔除偏差
@@ -856,6 +879,7 @@ def analyze_etf(etf_code: str, etf_name: str = "",
                     report_date=holdings.get("report_date"),
                     fin_period=periods[0] if periods else None,
                     holdings_full=bool(holdings.get("full", True)),
+                    holdings_base_report=holdings.get("base_report"),
                     fin_basis=basis,
                     updated_at=ds._now())
     res.n_total = len(stocks)
@@ -1157,7 +1181,8 @@ def analyze_etf(etf_code: str, etf_name: str = "",
         basis.update(latest=top, latest_label=report_label(top),
                      parts=ttm_basis(top), pit=True,
                      dist=sorted(used_periods.items(), key=lambda kv: -kv[1]),
-                     pe="实时总市值 ÷ 最新已披露 TTM 归母净利（与增速同源同期）")
+                     pe="实时总市值 ÷ 最新已披露 TTM 归母净利（与增速同源同期）；"
+                        "含亏损口径把亏损公司的负净利直接计入分母（合计净利≤0 时无定义）")
         res.fin_basis = basis
 
     valid = [r for r in rows if r.status == "ok"]
@@ -1191,6 +1216,24 @@ def analyze_etf(etf_code: str, etf_name: str = "",
             den += w / r.pe_ttm
     if den > 0:
         res.pe = num / den
+    res.pe_coverage = (num / w_sum * 100.0) if w_sum > 0 else None
+
+    # ---- 全样本整体法 PE（含亏损，v11）----------------------------------
+    #   PE_all = Σw / Σ(w · NP_i / MC_i)
+    # 分母是加权的「盈利收益率」合计：亏损股的 E/P 为负，自动扣减，
+    # 因此不需要任何样本筛选（与上面的唯一区别是不再跳过 NP<=0）。
+    # 满仓时等价于 Σ总市值/Σ归母净利，即中证/国证/Wind 的通行口径。
+    # 约束：合计净利 > 0，否则 PE 为负/无穷，置 None 由前端提示改用 PB/PS。
+    a_num = a_den = 0.0
+    for r in rows:
+        w = r.weight
+        if not (w and w > 0) or r.np_ttm is None or not (r.mktcap and r.mktcap > 0):
+            continue
+        a_num += w
+        a_den += w * r.np_ttm / r.mktcap
+    if a_den > 0:
+        res.pe_all = a_num / a_den
+    res.pe_all_coverage = (a_num / w_sum * 100.0) if w_sum > 0 else None
 
     # ---- 整体法增速（全口径 + 持仓权重加权）--------------------------------
     # 全部成分股都计入（亏损股、负增长股不剔除），并按持仓权重折算：
@@ -1354,7 +1397,16 @@ def analyze_etf(etf_code: str, etf_name: str = "",
         warns.append("⚠ 仅获取到季报前十大重仓（该 ETF 未披露半年报/年报全持仓），"
                      "样本不完整，PEG 仅供粗略参考")
     if res.coverage < 50:
-        warns.append(f"PEG 有效样本权重覆盖率仅 {res.coverage:.0f}%，正增长样本代表性不足")
+        warns.append(f"PEG 有效样本权重覆盖率仅 {res.coverage:.0f}%，正增长样本代表性不足"
+                     f"（PE 样本覆盖 {res.pe_coverage or 0:.0f}%，两者不是一回事）")
+    # 含亏损整体法：要么「合计亏损算不出」，要么「盈利股口径低估了」，二者都要说明
+    if res.pe_all is None and res.pe is not None:
+        warns.append("组合合计归母净利 ≤ 0，含亏损整体法 PE 无意义（负值/无穷），"
+                     "请改用 PB / PS / 前瞻 PE 判断")
+    elif res.pe_all and res.pe and res.pe > 0 and res.pe_all / res.pe > 1.15:
+        warns.append(f"亏损股占 {res.loss_weight:.1f}% 权重，盈利股口径 PE {res.pe:.1f} "
+                     f"低估约 {(res.pe_all / res.pe - 1) * 100:.0f}%，"
+                     f"含亏损整体法 PE 为 {res.pe_all:.1f}")
     if g_used is not None and g_used > 100:
         warns.append("组合增速异常高（>100%），PEG 会被显著低估，请结合绝对增速判断")
     if g_used is not None and 0 < g_used < 5:
@@ -1362,7 +1414,10 @@ def analyze_etf(etf_code: str, etf_name: str = "",
     if res.g_all is not None and g_used is not None and abs(g_used - res.g_all) > 5:
         warns.append(f"加权增速 {g_used:.1f}% 与等权增速 {res.g_all:.1f}% 相差 "
                      f"{abs(g_used - res.g_all):.1f}pct，组合权重集中，增速受大权重股主导")
-    if res.report_date:
+    if res.holdings_base_report and res.holdings_base_report != res.report_date:
+        warns.append(f"前十大权重按 {res.report_date} 最新定期报告更新，其余成分股沿用 "
+                     f"{res.holdings_base_report} 全持仓权重（按比例缩放），非实时")
+    elif res.report_date:
         warns.append(f"持仓为 {res.report_date} 定期报告数据，非实时")
     if res.forward and res.forward.get("cons_weight") is not None \
             and res.forward["cons_weight"] < 70:
@@ -1414,7 +1469,8 @@ def analyze_etf(etf_code: str, etf_name: str = "",
                 return [r for r in hist if r["date"] >= cutoff]
 
             pl: Dict[str, dict] = {}
-            for key, cur in (("pe", res.pe), ("pb", res.pb), ("ps", res.ps)):
+            for key, cur in (("pe", res.pe), ("pe_all", res.pe_all),
+                             ("pb", res.pb), ("ps", res.ps)):
                 if cur is None:
                     continue
                 wins = {"all": _win(None), "y5": _win(365 * 5), "y3": _win(365 * 3)}
@@ -1497,6 +1553,8 @@ def aggregate_history(rows: List[dict], by: str = "month") -> List[dict]:
             if cur:
                 out.append(cur)
             cur = {"key": k, "date": r["date"], "pe": r.get("pe"),
+                   "pe_all": r.get("pe_all"),
+                   "pe_all_coverage": r.get("pe_all_coverage"),
                    "g_ttm": r.get("g_ttm"), "g_all": r.get("g_all"),
                    "peg": r.get("peg"), "coverage": r.get("coverage"),
                    "pb": r.get("pb"), "ps": r.get("ps"),
@@ -1507,10 +1565,12 @@ def aggregate_history(rows: List[dict], by: str = "month") -> List[dict]:
                    "n_valid": r.get("n_valid"), "n_total": r.get("n_total"),
                    "report_date": r.get("report_date"), "days": 1,
                    "pe_lo": r.get("pe"), "pe_hi": r.get("pe"),
+                   "pe_all_lo": r.get("pe_all"), "pe_all_hi": r.get("pe_all"),
                    "peg_lo": r.get("peg"), "peg_hi": r.get("peg")}
         else:
             cur["date"] = r["date"]
-            for f in ("pe", "g_ttm", "g_all", "peg", "coverage", "pb", "ps",
+            for f in ("pe", "pe_all", "pe_all_coverage", "g_ttm", "g_all",
+                      "peg", "coverage", "pb", "ps",
                       "div_yield", "deduct_ttm", "np_ttm", "deduct_pe",
                       "g_deduct", "deduct_peg"):
                 if r.get(f) is not None:
@@ -1518,7 +1578,8 @@ def aggregate_history(rows: List[dict], by: str = "month") -> List[dict]:
             cur["n_valid"], cur["n_total"] = r.get("n_valid"), r.get("n_total")
             cur["report_date"] = r.get("report_date")
             cur["days"] += 1
-            for f, lo, hi in (("pe", "pe_lo", "pe_hi"), ("peg", "peg_lo", "peg_hi")):
+            for f, lo, hi in (("pe", "pe_lo", "pe_hi"), ("pe_all", "pe_all_lo", "pe_all_hi"),
+                              ("peg", "peg_lo", "peg_hi")):
                 v = r.get(f)
                 if v is None:
                     continue
@@ -1878,6 +1939,9 @@ def backfill_etf(etf_code: str, days: int = 180, on_stage=None,
         # PE   —— Σw / Σ(w / PE_i)，w 为基金披露的持仓权重
         # PB/PS 与 PE 同口径：只统计有数据的样本，覆盖率随列数如实反映
         pe_num = pe_den = 0.0                     # PE 用：所有盈利股
+        # 全样本整体法（v11）：分母累加 w·NP/MC，亏损股以负值自动扣减
+        pe_all_num = pe_all_den = 0.0
+        mc_num = 0.0                              # 当日有市值的权重（行情残缺判定）
         w_sum = 0.0                               # coverage 用：有效样本（PE>0 且正增长）
         np_now = np_pre = 0.0                     # 增速：全口径加权 TTM
         all_now = all_pre = 0.0                   # 等权全样本对照（简单相加）
@@ -1893,6 +1957,10 @@ def backfill_etf(etf_code: str, days: int = 180, on_stage=None,
             if not w or w <= 0:
                 continue
             cell = (pe_map.get(c) or {}).get(d)
+            # 行情可用度：只要当日有市值就算（不看净利/增速），
+            # 用于下面「行情残缺就整天跳过」的保护
+            if cell and cell[1] and cell[1] > 0:
+                mc_num += w
             # ---- 股息率：在 PE/增速过滤之前累积。亏损股照样分红，
             # 不能因被 PE 剔除而连带剔除其股息，否则组合股息率被高估。
             # A 股 = 近 12 个月累计每股分红 ÷ 当日收盘价（分红明细滚动窗口）
@@ -1947,6 +2015,11 @@ def backfill_etf(etf_code: str, days: int = 180, on_stage=None,
             if pe is not None and pe > 0:
                 pe_num += w
                 pe_den += w / pe
+            # 含亏损口径：亏损股照样计入，只是把负净利加进分母。
+            # 必须用自算的 市值/净利（不能用东财兜底 PE），否则负 PE 无法进分母。
+            if np_ttm is not None and cell and cell[1] and cell[1] > 0:
+                pe_all_num += w
+                pe_all_den += w * np_ttm / cell[1]
             # PB：所有有数据的股票（不筛增速，与 analyze_etf 口径一致）
             # A 股用当日 PB_MRQ 列（老数据可能为 NULL）；港股自算市值÷净资产
             # 净资产按 PIT 基准期取（当日之前最新已披露的归母净资产）
@@ -1981,9 +2054,18 @@ def backfill_etf(etf_code: str, days: int = 180, on_stage=None,
         # 把美股等根本拿不到数据的权重算进去，覆盖率会被系统性低估。
         w_avail = sum(w for c, w in wmap.items()
                       if w and w > 0 and store.is_valuable(market_by_code.get(c), c))
+        # 行情残缺保护：某天只有少数成分股有市值（港股快照/日 K 只回了一部分），
+        # 算出来的是「几只股票」的 PE，比没有值更糟，还会覆盖掉实时分析刚写入的
+        # 完整结果。低于阈值就跳过该日，保留库里已有的行。
+        if w_avail <= 0 or mc_num / w_avail < MIN_MC_COVERAGE:
+            return None
         return {
             "code": etf_code, "name": etf_name, "date": d,
-            "pe": pe_etf, "g_ttm": g, "g_all": g_eq,
+            "pe": pe_etf,
+            # 含亏损整体法：合计净利 <= 0 时无定义（与实时分析同口径）
+            "pe_all": (pe_all_num / pe_all_den) if pe_all_den > 0 else None,
+            "pe_all_coverage": (pe_all_num / w_avail * 100.0) if w_avail else None,
+            "g_ttm": g, "g_all": g_eq,
             "peg": (pe_etf / g) if (g and g > 0) else None,
             "coverage": (w_sum / w_avail * 100.0) if w_avail else 0.0,
             "n_valid": n_valid, "n_total": len(wmap), "report_date": rep,

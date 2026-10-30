@@ -64,6 +64,8 @@ def run_cli(code: str, mode: str) -> None:
     print(f"财报报告期      : {r.fin_period}")
     print(f"成分股          : 共 {r.n_total} 只，PEG 有效 {r.n_valid} 只，权重覆盖率 {r.coverage:.1f}%")
     print(f"整体法 PE(TTM)  : {r.pe:.2f}" if r.pe else "整体法 PE(TTM)  : N/A")
+    print(f"  └ 含亏损口径  : {r.pe_all:.2f}（覆盖 {r.pe_all_coverage:.0f}% 权重）"
+          if r.pe_all else "  └ 含亏损口径  : N/A（组合合计净利 ≤ 0）")
     print(f"整体法增速(TTM) : {r.g_ttm:.2f}%" if r.g_ttm is not None else "整体法增速(TTM) : N/A")
     print(f"整体法增速(最新): {r.g_latest:.2f}%" if r.g_latest is not None else "整体法增速(最新): N/A")
     print(f"等权增速(TTM参照): {r.g_all:.2f}%" if r.g_all is not None else "等权增速(TTM参照): N/A")
@@ -161,11 +163,13 @@ def main() -> None:
             return
         print(f"{args.history} {rows[0]['name']}  共 {len(rows)} 个交易日快照"
               f"（{args.basis} 口径）\n")
-        print(f"{'日期':<12}{'PE':>9}{'增速%':>10}{'全样本%':>10}{'PEG':>9}{'覆盖%':>8}{'持仓期':>13}")
+        print(f"{'日期':<12}{'PE':>9}{'PE含亏损':>11}{'增速%':>10}{'等权增速%':>11}"
+              f"{'PEG':>9}{'覆盖%':>8}{'持仓期':>13}")
         for r in rows:
             f = lambda v, d=2: "—" if v is None else f"{v:.{d}f}"    # noqa: E731
-            print(f"{r['date']:<12}{f(r['pe']):>9}{f(r['g_ttm'], 1):>10}"
-                  f"{f(r['g_all'], 1):>10}{f(r['peg'], 3):>9}{f(r['coverage'], 0):>8}"
+            print(f"{r['date']:<12}{f(r['pe']):>9}{f(r.get('pe_all')):>11}"
+                  f"{f(r['g_ttm'], 1):>10}{f(r['g_all'], 1):>11}"
+                  f"{f(r['peg'], 3):>9}{f(r['coverage'], 0):>8}"
                   f"{str(r['report_date'] or '—'):>13}")
         return
 

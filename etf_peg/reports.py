@@ -161,8 +161,10 @@ def refresh_stock(code: str, force: bool = False) -> dict:
     前端点开弹窗时调用：先用库里的数据秒开，再在后台悄悄补最新几篇，
     补完前端重渲染一次。这样既能「实时」，又不会让弹窗等网络。
     """
+    if is_hk_code(code):
+        return refresh_hk_stock(code, force=force)
     if not re.match(r"^\d{6}$", code):
-        return {"checked": False, "new": 0, "reason": "仅 A 股有研报数据"}
+        return {"checked": False, "new": 0, "reason": "仅 A 股/港股有研报数据"}
 
     if not force and time.time() - _CHECKED.get(code, 0.0) < _CHECK_TTL:
         return {"checked": True, "new": 0, "cached": True,
@@ -189,6 +191,131 @@ def refresh_stock(code: str, force: bool = False) -> dict:
     _CHECKED[code] = time.time()
     return {"checked": True, "new": new, "from": begin, "to": end,
             "pages": pages, "latest": store.stock_latest_report_date(code)}
+
+
+# --------------------------------------------------------------------------- #
+#  港股：大行评级（东财港股 F10）
+# --------------------------------------------------------------------------- #
+# 港股没有 A 股那种「逐篇研报 + 分年度 EPS 预测」的免费接口，但 F10 的
+# 「大行评级」有逐篇的机构评级与目标价（含前次评级/前次目标价），同属东财、
+# 免费可批量。差异必须显式说明：**只有评级与目标价，没有 EPS 预测**，
+# 因此港股只进入「评级/目标价」相关口径，不参与一致预期与前瞻 PEG。
+_HK_BASE = "https://datacenter.eastmoney.com/securities/api/data/v1/get?"
+_HK_REF = {"Referer": "https://emweb.securities.eastmoney.com/"}
+_HK_PAGE = 500
+_HK_MAX_PAGE = 10                     # 单只最多翻 10 页（约 5000 条，防御上游异常）
+_HK_CHECKED: Dict[str, float] = {}
+
+# 常见评级的好坏序（数字越小越好），用于把「评级文字」换算成上调/下调
+_RATING_RANK = {
+    "买入": 1, "强烈推荐": 1, "强力买入": 1, "增持": 2, "推荐": 2,
+    "跑赢行业": 2, "优于大市": 2, "中性": 3, "持有": 3, "同步大市": 3,
+    "减持": 4, "跑输行业": 4, "卖出": 5,
+}
+
+
+def is_hk_code(code: str) -> bool:
+    """港股 = 5 位数字（A 股 6 位，美股为字母）"""
+    return bool(re.match(r"^\d{5}$", code))
+
+
+def _hk_page(code: str, page: int) -> Optional[dict]:
+    """东财港股 F10「大行评级」单页，按发布日倒序。"""
+    params = {
+        "reportName": "RPT_HKPCF10_INFO_ORGRATING", "columns": "ALL",
+        "pageNumber": str(page), "pageSize": str(_HK_PAGE),
+        "filter": f'(SECUCODE="{code}.HK")',
+        "sortColumns": "PUBLISH_DATE", "sortTypes": "-1",
+        "source": "WEB", "client": "PC",
+    }
+    url = _HK_BASE + urllib.parse.urlencode(params)
+    try:
+        j = json.loads(ds.http_get(url, _HK_REF, timeout=30))
+    except Exception:                                   # noqa: BLE001
+        return None
+    return j if j.get("success") else None
+
+
+def _rating_change(cur: Optional[str], prev: Optional[str]) -> Optional[int]:
+    """评级文字 → 1 上调 / -1 下调 / 0 维持；无法判断时 None。
+
+    各家评级体系不完全可比（买入 / 增持 / 跑赢行业…），只做保守的方向判断，
+    表里没有的评级文字宁可留空，也不猜。
+    """
+    if not cur or not prev:
+        return None
+    if cur == prev:
+        return 0
+    a, b = _RATING_RANK.get(cur), _RATING_RANK.get(prev)
+    if a is None or b is None:
+        return None
+    return 1 if a < b else (-1 if a > b else 0)
+
+
+def _parse_hk(items: List[dict], code: str) -> List[dict]:
+    """接口行 → report 表结构（与 A 股研报共用一张表，靠 HK: 前缀保证主键唯一）"""
+    out: List[dict] = []
+    for it in items or []:
+        pub = (it.get("PUBLISH_DATE") or "")[:10]
+        org = (it.get("ORG_NAME") or "").strip()
+        if not pub or not org:
+            continue
+        cur_r = (it.get("RATING_NAME") or "").strip() or None
+        prev_r = (it.get("PRE_RATING_NAME") or "").strip() or None
+        out.append({
+            "info_code": f"HK:{code}:{it.get('ORG_CODE') or org}:{pub}",
+            "publish_date": pub,
+            "stock_code": code,
+            "stock_name": it.get("SECURITY_NAME_ABBR"),
+            "org_code": it.get("ORG_CODE"),
+            "org_name": org,
+            "researcher": None,
+            "rating": cur_r,
+            "last_rating": prev_r,
+            "rating_change": _rating_change(cur_r, prev_r),
+            "target_price": ds._num(it.get("TARGET_PRICE")),
+            "prev_target_price": ds._num(it.get("PRE_TARGET_PRICE")),
+            "eps_y1": None, "year_1": None, "eps_y2": None, "year_2": None,
+            "eps_y3": None, "year_3": None, "eps_last": None,
+            "industry": None, "title": None,
+        })
+    return out
+
+
+def refresh_hk_stock(code: str, force: bool = False) -> dict:
+    """
+    单只港股的大行评级同步（写入港股库的 report 表），带 5 分钟冷却。
+
+    增量策略：接口不支持按日期过滤时直接全量拉（单只通常 1~2 页），
+    靠 info_code 主键去重；历史评级不会变，重复拉只是浪费一点点流量。
+    """
+    if not is_hk_code(code):
+        return {"checked": False, "new": 0, "reason": "非港股代码"}
+    if not force and time.time() - _HK_CHECKED.get(code, 0.0) < _CHECK_TTL:
+        return {"checked": True, "new": 0, "cached": True}
+
+    new = 0
+    for page in range(1, _HK_MAX_PAGE + 1):
+        j = _hk_page(code, page)
+        if not j:
+            break
+        res = j.get("result") or {}
+        rows = _parse_hk(res.get("data") or [], code)
+        if not rows:
+            break
+        new += store.HK.save_reports(rows)
+        if page * _HK_PAGE >= int(res.get("count") or 0):
+            break
+    _HK_CHECKED[code] = time.time()
+    return {"checked": True, "new": new,
+            "latest": store.HK.stock_latest_report_date(code)}
+
+
+def _rows_of(code: str) -> List[dict]:
+    """按代码分流读研报：5 位 → 港股库；6 位 → A 股库（两库表结构相同）"""
+    if is_hk_code(code):
+        return store.HK.load_stock_reports(code)
+    return store.load_stock_reports(code)
 
 
 # --------------------------------------------------------------------------- #
@@ -284,8 +411,13 @@ def stock_forecast(code: str, detail_limit: int = 200) -> dict:
     返回 {} 之外的字段都是前端直接渲染的：targets / series / revision / detail。
     只统计「至少 3 篇研报覆盖」的财年，避免一两家机构的口径被当成一致预期。
     """
-    rows = store.load_stock_reports(code)
+    hk = is_hk_code(code)
+    rows = _rows_of(code)
     if not rows:
+        if hk:
+            return {"code": code, "empty": True,
+                    "msg": "该股暂无港股大行评级数据（打开弹窗时会自动尝试拉取，"
+                           "上游可能暂无机构覆盖）。"}
         # 只有空结果才需要全库统计：COUNT(*) 扫 14 万行，批量调用时不能每只都算一次
         stats = store.report_stats()
         return {"code": code, "empty": True,
@@ -329,6 +461,7 @@ def stock_forecast(code: str, detail_limit: int = 200) -> dict:
             "rating": r.get("rating"),
             "last_rating": r.get("last_rating"),
             "target": r.get("target_price"),
+            "prev_target": r.get("prev_target_price"),
             "eps": {str(k): v for k, v in ex.items()},
             "title": r.get("title"),
         })
@@ -361,9 +494,24 @@ def stock_forecast(code: str, detail_limit: int = 200) -> dict:
         return r.get("org_code") or r.get("org_name") or r["info_code"]
     orgs_all = {_org(r) for r in rows}
     orgs_fc = {_org(r) for r in rows if _expand(r)}
+
+    # 月末收盘价（不复权）：与预测 EPS 画在同一张图上（右轴），
+    # 「股价 ÷ 预测 EPS」即市场当时给的隐含 PE。
+    # stock_pe 只有 A 股，港股/美股取到空 dict，前端自动不画右轴。
+    px = store.load_stock_pe([code], rows[0]["publish_date"],
+                             date.today().isoformat()).get(code, {})
+    by_month: Dict[str, float] = {}
+    for d in sorted(px):                       # 升序遍历，同月最后一条即月末
+        close = px[d][2]
+        if close:
+            by_month[d[:7]] = close
+    price = [{"m": m, "c": by_month[m]} for m in sorted(by_month)]
+
     return {
         "code": code,
         "name": rows[-1].get("stock_name") or code,
+        # 港股只有评级/目标价、没有分年度 EPS：前端据此切换展示形态
+        "no_eps": hk and not any(_expand(r) for r in rows),
         "total": len(rows),
         "n_org": len(orgs_all),
         "n_org_fc": len(orgs_fc),
@@ -377,6 +525,7 @@ def stock_forecast(code: str, detail_limit: int = 200) -> dict:
         "detail": detail,
         "orgs": orgs,
         "industry": rows[-1].get("industry"),
+        "price": price,
     }
 
 
@@ -394,9 +543,19 @@ def forecast_panel(codes: List[str], per_org: int = 4, months: int = 36,
     cutoff = (date.today() - timedelta(days=int(months * 30.5))).isoformat()
     out: List[dict] = []
     for code in codes[:limit]:
-        if not re.match(r"^\d{6}$", code):
-            continue                       # 港股/美股没有研报数据
-        rows = store.load_stock_reports(code)
+        hk = is_hk_code(code)
+        if not hk and not re.match(r"^\d{6}$", code):
+            continue                       # 美股（字母代码）没有免费研报源
+        if hk:
+            # 港股按需同步：库里没有、或最新一条已超过一天，就回源一次
+            # （单只 1~2 页，带 5 分钟冷却；失败静默，不影响已有数据）
+            latest = store.HK.stock_latest_report_date(code)
+            if not latest or latest < (date.today() - timedelta(days=1)).isoformat():
+                try:
+                    refresh_hk_stock(code)
+                except Exception:          # noqa: BLE001
+                    pass
+        rows = _rows_of(code)
         if not rows:
             continue
 
@@ -411,7 +570,9 @@ def forecast_panel(codes: List[str], per_org: int = 4, months: int = 36,
             rs.sort(key=lambda x: (x["publish_date"], x["info_code"]))
             idx = [i for i in range(len(rs)) if _expand(rs[i])]
             if not idx:
-                continue                   # 只给评级、没填 EPS 的研报对预测分析没意义
+                if not hk:
+                    continue               # 只给评级、没填 EPS 的研报对预测分析没意义
+                idx = list(range(len(rs)))  # 港股本来就没有 EPS，按评级/目标价输出
 
             # 1) 最近 per_org 篇：看这家机构当下在说什么
             chosen = idx[-per_org:]
@@ -448,7 +609,9 @@ def forecast_panel(codes: List[str], per_org: int = 4, months: int = 36,
                 picked.append({
                     "d": rs[i]["publish_date"],
                     "r": rs[i].get("rating"),
+                    "lr": rs[i].get("last_rating"),
                     "t": rs[i].get("target_price"),
+                    "pt": rs[i].get("prev_target_price"),
                     "e": {str(k): v for k, v in cur.items()},
                     "chg": chg,
                 })
@@ -472,6 +635,8 @@ def forecast_panel(codes: List[str], per_org: int = 4, months: int = 36,
             "total": len(rows),
             "n_org": len(by_org),
             "years": ys,
+            # 港股：只有评级/目标价，没有分年度 EPS 预测
+            "no_eps": hk and not ys,
             "orgs": orgs,
         })
     return out
@@ -486,8 +651,8 @@ def batch_forecast(codes: List[str], limit: int = 40) -> Dict[str, dict]:
     """
     out: Dict[str, dict] = {}
     for code in codes[:limit]:
-        if not re.match(r"^\d{6}$", code):
-            continue                       # 港股/美股没有研报数据，直接跳过
+        if not is_hk_code(code) and not re.match(r"^\d{6}$", code):
+            continue                       # 美股（字母代码）没有免费研报源
         d = stock_forecast(code, detail_limit=0)
         if d.get("empty"):
             continue

@@ -140,6 +140,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS holding_meta (
                 etf_code TEXT NOT NULL, report_date TEXT NOT NULL,
                 full INTEGER, n_stocks INTEGER, fetched_at TEXT,
+                -- 长尾权重的来源期：最新一期是季报（只有前十大）时，
+                -- report_date 记前十的期次、base_report 记全持仓的期次，两者不同即合并口径
+                base_report TEXT,
                 PRIMARY KEY (etf_code, report_date)
             );
 
@@ -207,6 +210,9 @@ class Store:
                 -- v9 起：归母净利合计（全口径加权，元）与扣非 PEG 三件套。
                 -- np_ttm 与 deduct_ttm 完全对称；g_deduct 只在 >0 时 deduct_peg 有值
                 np_ttm REAL,
+                -- v11：全样本整体法 PE（含亏损，Σw/Σ(w·NP/MC)）及其样本覆盖。
+                -- 合计净利 ≤ 0 时为 NULL（PE 无定义），不是缺数据
+                pe_all REAL, pe_all_coverage REAL,
                 deduct_pe REAL,
                 g_deduct REAL,
                 deduct_peg REAL,
@@ -251,6 +257,8 @@ class Store:
                 org_code TEXT, org_name TEXT, researcher TEXT,
                 rating TEXT, last_rating TEXT, rating_change INTEGER,
                 target_price REAL,
+                -- 港股大行评级专有：上次目标价（A 股研报无此字段，为 NULL）
+                prev_target_price REAL,
                 eps_y1 REAL, year_1 INTEGER,
                 eps_y2 REAL, year_2 INTEGER,
                 eps_y3 REAL, year_3 INTEGER,
@@ -281,6 +289,9 @@ class Store:
             _d_cols = {r[1] for r in c.execute("PRAGMA table_info(etf_daily)")}
             if "deduct_ttm" not in _d_cols:
                 c.execute("ALTER TABLE etf_daily ADD COLUMN deduct_ttm REAL")
+            _r_cols = {r[1] for r in c.execute("PRAGMA table_info(report)")}
+            if "prev_target_price" not in _r_cols:
+                c.execute("ALTER TABLE report ADD COLUMN prev_target_price REAL")
             # v9：归母净利合计与扣非 PEG 三件套（老库补列，历史行 NULL，
             # 由 CALC_VERSION 升版后的强制重算补齐）
             for _col in ("np_ttm", "deduct_pe", "g_deduct", "deduct_peg"):
@@ -336,6 +347,12 @@ class Store:
                     SELECT etf_code, 'pit', version, updated_at FROM etf_calc_version""")
                 c.execute("DROP TABLE etf_calc_version")
                 c.execute("ALTER TABLE etf_calc_version_v10 RENAME TO etf_calc_version")
+            # v11：全样本整体法 PE（含亏损）。必须在 v10 重建之后补列——
+            # 重建表是按旧列清单建的，上面的 ALTER 循环那时已经跑完了。
+            _ed_cols = {r[1] for r in c.execute("PRAGMA table_info(etf_daily)")}
+            for _col in ("pe_all", "pe_all_coverage"):
+                if _col not in _ed_cols:
+                    c.execute(f"ALTER TABLE etf_daily ADD COLUMN {_col} REAL")
             # 港股：PE 要求市值与净利同币种，股本用于按报告期还原历史市值
             if "currency" not in cols:
                 c.execute("ALTER TABLE fin ADD COLUMN currency TEXT")
@@ -351,6 +368,9 @@ class Store:
                 c.execute("ALTER TABLE fin ADD COLUMN deduct_np REAL")
             if "market" not in {r[1] for r in c.execute("PRAGMA table_info(holding)")}:
                 c.execute("ALTER TABLE holding ADD COLUMN market TEXT")
+            # 长尾权重的来源期（合并口径）；老库补列，历史行为 NULL 即「纯单期持仓」
+            if "base_report" not in {r[1] for r in c.execute("PRAGMA table_info(holding_meta)")}:
+                c.execute("ALTER TABLE holding_meta ADD COLUMN base_report TEXT")
             c.execute("DROP TABLE IF EXISTS _mkt_placeholder")
             c.commit()
             self._ready = True
@@ -615,7 +635,8 @@ class Store:
     # ------------------------------------------------------------------ #
     _REPORT_COLS = ("info_code", "publish_date", "stock_code", "stock_name",
                     "org_code", "org_name", "researcher", "rating", "last_rating",
-                    "rating_change", "target_price", "eps_y1", "year_1",
+                    "rating_change", "target_price", "prev_target_price",
+                    "eps_y1", "year_1",
                     "eps_y2", "year_2", "eps_y3", "year_3", "eps_last",
                     "industry", "title")
 
@@ -640,7 +661,7 @@ class Store:
         out: List[dict] = []
         for r in self._conn().execute(
                 "SELECT info_code, publish_date, org_code, org_name, researcher, "
-                "rating, last_rating, rating_change, target_price, "
+                "rating, last_rating, rating_change, target_price, prev_target_price, "
                 "eps_y1, year_1, eps_y2, year_2, eps_y3, year_3, eps_last, "
                 "stock_name, industry, title "
                 "FROM report WHERE stock_code=? ORDER BY publish_date, info_code", (code,)):
@@ -648,9 +669,10 @@ class Store:
                 "info_code": r[0], "publish_date": r[1], "org_code": r[2],
                 "org_name": r[3], "researcher": r[4], "rating": r[5],
                 "last_rating": r[6], "rating_change": r[7], "target_price": r[8],
-                "eps_y1": r[9], "year_1": r[10], "eps_y2": r[11], "year_2": r[12],
-                "eps_y3": r[13], "year_3": r[14], "eps_last": r[15],
-                "stock_name": r[16], "industry": r[17], "title": r[18],
+                "prev_target_price": r[9],
+                "eps_y1": r[10], "year_1": r[11], "eps_y2": r[12], "year_2": r[13],
+                "eps_y3": r[14], "year_3": r[15], "eps_last": r[16],
+                "stock_name": r[17], "industry": r[18], "title": r[19],
             })
         return out
 
@@ -695,7 +717,7 @@ class Store:
     def load_holdings(self, etf_code: str, report_date: str) -> Optional[dict]:
         self.init()
         c = self._conn()
-        m = c.execute("SELECT full, n_stocks, fetched_at FROM holding_meta "
+        m = c.execute("SELECT full, n_stocks, fetched_at, base_report FROM holding_meta "
                       "WHERE etf_code=? AND report_date=?", (etf_code, report_date)).fetchone()
         if not m:
             return None
@@ -704,6 +726,7 @@ class Store:
             "WHERE etf_code=? AND report_date=?", (etf_code, report_date)).fetchall()
         return {
             "report_date": report_date,
+            "base_report": m[3],
             "full": bool(m[0]),
             "stocks": [{"code": r[0], "name": r[1], "weight": r[2],
                         "shares": r[3], "market_value": r[4], "market": r[5]} for r in rows],
@@ -711,7 +734,7 @@ class Store:
         }
 
     def save_holdings(self, etf_code: str, report_date: str, full: bool,
-                      stocks: List[dict]) -> None:
+                      stocks: List[dict], base_report: Optional[str] = None) -> None:
         self.init()
         with _WRITE_LOCK:
             c = self._conn()
@@ -721,8 +744,11 @@ class Store:
                 "INSERT OR REPLACE INTO holding VALUES (?,?,?,?,?,?,?,?)",
                 [(etf_code, report_date, s["code"], s.get("name"), s.get("weight"),
                   s.get("shares"), s.get("market_value"), s.get("market")) for s in stocks])
-            c.execute("INSERT OR REPLACE INTO holding_meta VALUES (?,?,?,?,?)",
-                      (etf_code, report_date, 1 if full else 0, len(stocks), _now()))
+            c.execute("INSERT OR REPLACE INTO holding_meta "
+                      "(etf_code, report_date, full, n_stocks, fetched_at, base_report) "
+                      "VALUES (?,?,?,?,?,?)",
+                      (etf_code, report_date, 1 if full else 0, len(stocks), _now(),
+                       base_report))
             c.commit()
 
     def get_probe(self, etf_code: str) -> Tuple[float, Optional[str]]:
@@ -1052,12 +1078,14 @@ class Store:
         with _WRITE_LOCK:
             c = self._conn()
             c.executemany(
-                "INSERT OR REPLACE INTO etf_daily (d, etf_code, name, pe, g_ttm, g_all, "
+                "INSERT OR REPLACE INTO etf_daily (d, etf_code, name, pe, pe_all, "
+                "pe_all_coverage, g_ttm, g_all, "
                 "peg, coverage, n_valid, n_total, report_date, pb, ps, div_yield, "
                 "pe_pct, pb_pct, ps_pct, div_calc, deduct_ttm, "
                 "np_ttm, deduct_pe, g_deduct, deduct_peg, basis) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [(r.get("date") or default_d, r.get("code"), r.get("name"), r.get("pe"),
+                  r.get("pe_all"), r.get("pe_all_coverage"),
                   r.get("g_ttm"), r.get("g_all"), r.get("peg"), r.get("coverage"),
                   r.get("n_valid"), r.get("n_total"), r.get("report_date"),
                   r.get("pb"), r.get("ps"), r.get("div_yield"),
@@ -1094,7 +1122,7 @@ class Store:
         rows = self._conn().execute(
             "SELECT d, name, pe, g_ttm, g_all, peg, coverage, n_valid, n_total, report_date,"
             " pb, ps, div_yield, pe_pct, pb_pct, ps_pct, div_calc, deduct_ttm, "
-            " np_ttm, deduct_pe, g_deduct, deduct_peg "
+            " np_ttm, deduct_pe, g_deduct, deduct_peg, pe_all, pe_all_coverage "
             "FROM etf_daily WHERE etf_code=? AND basis=? ORDER BY d DESC LIMIT ?",
             (etf_code, basis, days)).fetchall()
         return [{"date": r[0], "name": r[1], "pe": r[2], "g_ttm": r[3], "g_all": r[4],
@@ -1103,7 +1131,8 @@ class Store:
                  "pe_pct": r[13], "pb_pct": r[14], "ps_pct": r[15],
                  "div_calc": r[16], "deduct_ttm": r[17],
                  "np_ttm": r[18], "deduct_pe": r[19], "g_deduct": r[20],
-                 "deduct_peg": r[21], "basis": basis} for r in rows]
+                 "deduct_peg": r[21], "pe_all": r[22],
+                 "pe_all_coverage": r[23], "basis": basis} for r in rows]
 
     def get_calc_version(self, etf_code: str, basis: str = "fixed") -> int:
         """该 ETF 某口径的历史快照是用哪个计算口径版本算的（0 = 从未记录）"""

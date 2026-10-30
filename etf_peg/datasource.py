@@ -462,8 +462,11 @@ def fetch_etf_holdings(etf_code: str, force: bool = False) -> dict:
     时才回源探活（约每季度一次），其余时间直接读本地库，零网络请求。
 
     重要：监管要求基金**季报只披露前十大重仓**，半年报/年报才披露全部持仓。
-    因此这里优先抓取最近一期的半年报或年报，只有实在拿不到时才退回季报前十大，
-    并用 full=False 标记，交由上层给出「样本不完整」的警示。
+    因此股票集合用最近一期半年报/年报（全持仓），前十大权重用**最新一期定期
+    报告**覆盖（见 _fetch_holdings_upstream），既拿到最新调仓，也不丢长尾；
+    实在拿不到全持仓时才退回季报前十大，并用 full=False 标记交由上层警示。
+    `base_report` 记录长尾权重的来源期，与 `report_date`（前十权重的来源期）不同
+    即为合并口径。
     """
     # 1) 本地库命中且没必要探活 → 直接返回，不走网络
     if not force:
@@ -477,7 +480,8 @@ def fetch_etf_holdings(etf_code: str, force: bool = False) -> dict:
     result = _fetch_holdings_upstream(etf_code)
     if result.get("report_date") and result.get("stocks"):
         store.save_holdings(etf_code, result["report_date"],
-                            bool(result.get("full")), result["stocks"])
+                            bool(result.get("full")), result["stocks"],
+                            base_report=result.get("base_report"))
         store.set_probe(etf_code, result["report_date"])
 
     # 3) 上游失败时退回本地已有数据，不要让整批扫描失败
@@ -899,44 +903,149 @@ def init_all_stock_div(on_progress=None, cancel=None) -> dict:
             "coverage": store.div_coverage()}
 
 
+def _merge_newer_weights(base: dict, newer: dict) -> dict:
+    """
+    用最新一期（季报）的权重重置基期（半年报/年报）全持仓里对应的股票。
+
+    为什么需要：季报只披露前十大，单用它会丢掉占股票仓位两三成的长尾；
+    只用半年报/年报又会忽略最新调仓——前十大的权重在季报里是公开的，
+    没有理由继续用三个月前的旧值（003096 实测：药明康德 9.85%→10.15%、
+    康龙化成 8.45%→10.06%，君实生物跌出前十、纳微科技新进）。
+
+    规则：
+      · 出现在最新期的股票 → 权重/股数/市值整行用最新期；
+      · 其余股票 → 保留基期权重，按同一比例缩放，使权重合计与基期一致
+        （假设股票仓位未变；长尾个股权重都很小，缩放系数通常≈1）。
+    """
+    top = {s["code"]: s for s in newer["stocks"]}
+    base_stocks = base["stocks"]
+    total_base = sum(s.get("weight") or 0 for s in base_stocks)
+    sum_top_new = sum(s.get("weight") or 0 for s in newer["stocks"])
+    rest_base = sum((s.get("weight") or 0) for s in base_stocks if s["code"] not in top)
+    target_rest = max(total_base - sum_top_new, 0.0)
+    scale = (target_rest / rest_base) if rest_base > 1e-9 else 1.0
+
+    out: List[dict] = []
+    have = set()
+    for s in base_stocks:
+        code = s["code"]
+        have.add(code)
+        t = top.get(code)
+        if t:
+            out.append({
+                "code": code,
+                "name": t.get("name") or s.get("name"),
+                "market": t.get("market") or s.get("market"),
+                "weight": t.get("weight"),
+                "shares": t.get("shares"),
+                "market_value": t.get("market_value"),
+            })
+        else:
+            m = dict(s)
+            m["weight"] = round((s.get("weight") or 0) * scale, 4)
+            out.append(m)
+    # 基期没有、最新期新进重仓的股票（如新进前十）必须补进来
+    for code, t in top.items():
+        if code not in have:
+            out.append(dict(t))
+
+    return {
+        "report_date": newer["report_date"],
+        "base_report": base["report_date"],
+        "full": True,
+        "stocks": out,
+        "fetched_at": _now(),
+    }
+
+
+def _half_year_candidates(today: date, newest: Optional[str]) -> List[Tuple[int, int]]:
+    """半年报/年报表的请求参数，由新到旧；跳过尚未到来、或晚于最新一期的期"""
+    out: List[Tuple[int, int]] = []
+    for y in (today.year, today.year - 1, today.year - 2):
+        for m in (12, 6):
+            if date(y, m, 1) > today:
+                continue
+            rep = f"{y}-{m:02d}-{31 if m == 12 else 30}"
+            if newest and rep > newest:
+                continue          # 比最新一期还新，肯定还没披露
+            out.append((y, m))
+    out.sort(reverse=True)
+    return out
+
+
 def _fetch_holdings_upstream(etf_code: str) -> dict:
+    """
+    㧟最近一期持仓。
+
+    选期规则（与天天基金 F10 一致，但保留全持仓覆盖）：
+      1. 先取「最新一期定期报告」——季报只有前十大，半年报/年报是全持仓；
+      2. 最新一期若只给了前十大，再取它之前最近一期半年报/年报补齐全持仓；
+      3. 两者合并：前十大用最新期权重，其余股票沿用基期权重（见 _merge_newer_weights）。
+    旧口径「股票数最多的一期优先」会让三季报（10 只）永远输给中报（124 只），
+    权重停在三个月前，与天天基金显示的当期权重对不上。
+    """
     base = ("https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
             f"?type=jjcc&code={etf_code}&topline=3000&year={{y}}&month={{m}}&rt=0.1")
     today = date.today()
 
-    # 候选：今年半年报 → 去年年报 → 去年半年报 → 前年年报（只有半年报/年报有全持仓）
-    # 跳过尚未到来的报告期，否则白花一次请求（每只 ETF 都要多等一个 RTT）
-    tries: List[Tuple[object, object]] = []
-    for y in (today.year, today.year - 1, today.year - 2):
-        for m in (6, 12):
-            if date(y, m, 1) > today:
-                continue
-            tries.append((y, m))
-    tries.append(("", ""))                    # 兜底：默认返回最近一期（可能只有前十大）
-
-    best: Optional[dict] = None
-    for y, m in tries:
-        if best and best["full"]:
-            break
+    def pull(y, m) -> Dict[str, dict]:
+        """请求一期页面，返回 {报告期: 持仓}（同一期出现多段时取股票数最多的）"""
+        got: Dict[str, dict] = {}
         try:
             html = _html(base.format(y=y, m=m), etf_code)
         except Exception:                      # noqa: BLE001
-            continue
+            return got
         for report_date, frag in _split_sections(html):
+            if not report_date:
+                continue
             stocks = _parse_rows(frag)
             if not stocks:
                 continue
-            is_full = len(stocks) > 10
-            cand = {"report_date": report_date, "full": is_full, "stocks": stocks}
-            if best is None or (cand["full"] and not best["full"]) or \
-               (cand["full"] == best["full"] and len(stocks) > len(best["stocks"])):
-                best = cand
+            old = got.get(report_date)
+            if old is None or len(stocks) > len(old["stocks"]):
+                got[report_date] = {"report_date": report_date,
+                                    "full": len(stocks) > 10, "stocks": stocks}
+        return got
 
-    if best is None:
-        best = {"report_date": None, "full": False, "stocks": []}
+    # 1) 最新一期（季度报告期按法定截止日算，上游当天就能给）
+    periods = pull("", "")
+    newest = max(periods) if periods else None
+    cur = periods.get(newest) if newest else None
+    if cur and cur["full"]:
+        cur["fetched_at"] = _now()
+        return cur
 
-    best["fetched_at"] = _now()
-    return best
+    # 2) 最新一期是季报（前十大）→ 找最近一期半年报/年报补齐全持仓
+    full: Optional[dict] = None
+    for y, m in _half_year_candidates(today, newest):
+        got = pull(y, m)
+        if not got:
+            continue
+        # 上游常把最近几期一起返回，期间若有更新的期次以新的为准
+        for rep in sorted(got, reverse=True):
+            if newest is None or rep > newest:
+                newest, cur = rep, got[rep]
+        if cur and cur["full"]:
+            full = None                       # 最新一期本身就是全持仓，无需合并
+            break
+        want = f"{y}-{m:02d}-{31 if m == 12 else 30}"
+        cand = got.get(want)
+        if cand and cand["full"]:
+            full = cand
+            break
+
+    if cur and cur["full"]:
+        cur["fetched_at"] = _now()
+        return cur
+    if full and cur and full["report_date"] < cur["report_date"]:
+        return _merge_newer_weights(full, cur)
+    if full:
+        full["fetched_at"] = _now()
+        return full
+    if cur:
+        cur["fetched_at"] = _now()
+        return cur
+    return {"report_date": None, "full": False, "stocks": []}
 
 
 # --------------------------------------------------------------------------- #
